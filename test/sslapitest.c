@@ -1,12 +1,21 @@
 /*
- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
 
+/*
+ * We need access to the deprecated low level HMAC APIs for legacy purposes
+ * when the deprecated calls are not hidden
+ */
+#ifndef OPENSSL_NO_DEPRECATED_3_0
+# define OPENSSL_SUPPRESS_DEPRECATED
+#endif
+
+#include <stdio.h>
 #include <string.h>
 
 #include <openssl/opensslconf.h>
@@ -17,17 +26,61 @@
 #include <openssl/srp.h>
 #include <openssl/txt_db.h>
 #include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <openssl/core_names.h>
+#include <openssl/core_dispatch.h>
+#include <openssl/provider.h>
 
 #include "ssltestlib.h"
 #include "testutil.h"
 #include "testutil/output.h"
 #include "internal/nelem.h"
-#include "../ssl/ssl_locl.h"
+#include "internal/ktls.h"
+#include "../ssl/ssl_local.h"
 
+/* Defined in filterprov.c */
+OSSL_provider_init_fn filter_provider_init;
+int filter_provider_set_filter(int operation, const char *name);
+
+/* Defined in tls-provider.c */
+int tls_provider_init(const OSSL_CORE_HANDLE *handle,
+                      const OSSL_DISPATCH *in,
+                      const OSSL_DISPATCH **out,
+                      void **provctx);
+DEFINE_STACK_OF(OCSP_RESPID)
+DEFINE_STACK_OF(X509)
+DEFINE_STACK_OF(X509_NAME)
+
+static OPENSSL_CTX *libctx = NULL;
+static OSSL_PROVIDER *defctxnull = NULL;
+
+#ifndef OPENSSL_NO_TLS1_3
+
+static SSL_SESSION *clientpsk = NULL;
+static SSL_SESSION *serverpsk = NULL;
+static const char *pskid = "Identity";
+static const char *srvid;
+
+static int use_session_cb(SSL *ssl, const EVP_MD *md, const unsigned char **id,
+                          size_t *idlen, SSL_SESSION **sess);
+static int find_session_cb(SSL *ssl, const unsigned char *identity,
+                           size_t identity_len, SSL_SESSION **sess);
+
+static int use_session_cb_cnt = 0;
+static int find_session_cb_cnt = 0;
+
+static SSL_SESSION *create_a_psk(SSL *ssl);
+#endif
+
+static char *certsdir = NULL;
 static char *cert = NULL;
 static char *privkey = NULL;
+static char *cert2 = NULL;
+static char *privkey2 = NULL;
 static char *srpvfile = NULL;
 static char *tmpfilename = NULL;
+
+static int is_fips = 0;
 
 #define LOG_BUFFER_SIZE 2048
 static char server_log_buffer[LOG_BUFFER_SIZE + 1] = {0};
@@ -78,6 +131,17 @@ static unsigned char serverinfov2[] = {
     0x00, 0x01, /* Extension length is 1 byte */
     0xff        /* Dummy extension data */
 };
+
+static int hostname_cb(SSL *s, int *al, void *arg)
+{
+    const char *hostname = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
+
+    if (hostname != NULL && (strcmp(hostname, "goodhost") == 0
+                             || strcmp(hostname, "altgoodhost") == 0))
+        return  SSL_TLSEXT_ERR_OK;
+
+    return SSL_TLSEXT_ERR_NOACK;
+}
 
 static void client_keylog_callback(const SSL *ssl, const char *line)
 {
@@ -287,18 +351,19 @@ static int test_keylog(void)
     SSL_CTX *cctx = NULL, *sctx = NULL;
     SSL *clientssl = NULL, *serverssl = NULL;
     int testresult = 0;
-    struct sslapitest_log_counts expected = {0};
+    struct sslapitest_log_counts expected;
 
     /* Clean up logging space */
+    memset(&expected, 0, sizeof(expected));
     memset(client_log_buffer, 0, sizeof(client_log_buffer));
     memset(server_log_buffer, 0, sizeof(server_log_buffer));
     client_log_buffer_index = 0;
     server_log_buffer_index = 0;
     error_writing_log = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
                                        TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+                                       TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         return 0;
 
@@ -368,19 +433,20 @@ static int test_keylog_no_master_key(void)
     SSL *clientssl = NULL, *serverssl = NULL;
     SSL_SESSION *sess = NULL;
     int testresult = 0;
-    struct sslapitest_log_counts expected = {0};
+    struct sslapitest_log_counts expected;
     unsigned char buf[1];
     size_t readbytes, written;
 
     /* Clean up logging space */
+    memset(&expected, 0, sizeof(expected));
     memset(client_log_buffer, 0, sizeof(client_log_buffer));
     memset(server_log_buffer, 0, sizeof(server_log_buffer));
     client_log_buffer_index = 0;
     server_log_buffer_index = 0;
     error_writing_log = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey))
         || !TEST_true(SSL_CTX_set_max_early_data(sctx,
                                                  SSL3_RT_MAX_PLAIN_LENGTH)))
@@ -525,8 +591,8 @@ static int test_client_hello_cb(void)
     SSL *clientssl = NULL, *serverssl = NULL;
     int testctr = 0, testresult = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
     SSL_CTX_set_client_hello_cb(sctx, full_client_hello_callback, &testctr);
@@ -560,6 +626,162 @@ end:
 
     return testresult;
 }
+
+static int test_no_ems(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+
+    if (!create_ssl_ctx_pair(libctx, TLS_server_method(), TLS_client_method(),
+                             TLS1_VERSION, TLS1_2_VERSION,
+                             &sctx, &cctx, cert, privkey)) {
+        printf("Unable to create SSL_CTX pair\n");
+        goto end;
+    }
+
+    SSL_CTX_set_options(sctx, SSL_OP_NO_EXTENDED_MASTER_SECRET);
+
+    if (!create_ssl_objects(sctx, cctx, &serverssl, &clientssl, NULL, NULL)) {
+        printf("Unable to create SSL objects\n");
+        goto end;
+    }
+
+    if (!create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)) {
+        printf("Creating SSL connection failed\n");
+        goto end;
+    }
+
+    if (SSL_get_extms_support(serverssl)) {
+        printf("Server reports Extended Master Secret support\n");
+        goto end;
+    }
+
+    if (SSL_get_extms_support(clientssl)) {
+        printf("Client reports Extended Master Secret support\n");
+        goto end;
+    }
+    testresult = 1;
+
+end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+/*
+ * Very focused test to exercise a single case in the server-side state
+ * machine, when the ChangeCipherState message needs to actually change
+ * from one cipher to a different cipher (i.e., not changing from null
+ * encryption to real encryption).
+ */
+static int test_ccs_change_cipher(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    SSL_SESSION *sess = NULL, *sesspre, *sesspost;
+    int testresult = 0;
+    int i;
+    unsigned char buf;
+    size_t readbytes;
+
+    /*
+     * Create a conection so we can resume and potentially (but not) use
+     * a different cipher in the second connection.
+     */
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION, TLS1_2_VERSION,
+                                       &sctx, &cctx, cert, privkey))
+            || !TEST_true(SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                          NULL, NULL))
+            || !TEST_true(SSL_set_cipher_list(clientssl, "AES128-GCM-SHA256"))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+            || !TEST_ptr(sesspre = SSL_get0_session(serverssl))
+            || !TEST_ptr(sess = SSL_get1_session(clientssl)))
+        goto end;
+
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* Resume, preferring a different cipher. Our server will force the
+     * same cipher to be used as the initial handshake. */
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                          NULL, NULL))
+            || !TEST_true(SSL_set_session(clientssl, sess))
+            || !TEST_true(SSL_set_cipher_list(clientssl, "AES256-GCM-SHA384:AES128-GCM-SHA256"))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+            || !TEST_true(SSL_session_reused(clientssl))
+            || !TEST_true(SSL_session_reused(serverssl))
+            || !TEST_ptr(sesspost = SSL_get0_session(serverssl))
+            || !TEST_ptr_eq(sesspre, sesspost)
+            || !TEST_int_eq(TLS1_CK_RSA_WITH_AES_128_GCM_SHA256,
+                            SSL_CIPHER_get_id(SSL_get_current_cipher(clientssl))))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /*
+     * Now create a fresh connection and try to renegotiate a different
+     * cipher on it.
+     */
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL))
+            || !TEST_true(SSL_set_cipher_list(clientssl, "AES128-GCM-SHA256"))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+            || !TEST_ptr(sesspre = SSL_get0_session(serverssl))
+            || !TEST_true(SSL_set_cipher_list(clientssl, "AES256-GCM-SHA384"))
+            || !TEST_true(SSL_renegotiate(clientssl))
+            || !TEST_true(SSL_renegotiate_pending(clientssl)))
+        goto end;
+    /* Actually drive the renegotiation. */
+    for (i = 0; i < 3; i++) {
+        if (SSL_read_ex(clientssl, &buf, sizeof(buf), &readbytes) > 0) {
+            if (!TEST_ulong_eq(readbytes, 0))
+                goto end;
+        } else if (!TEST_int_eq(SSL_get_error(clientssl, 0),
+                                SSL_ERROR_WANT_READ)) {
+            goto end;
+        }
+        if (SSL_read_ex(serverssl, &buf, sizeof(buf), &readbytes) > 0) {
+            if (!TEST_ulong_eq(readbytes, 0))
+                goto end;
+        } else if (!TEST_int_eq(SSL_get_error(serverssl, 0),
+                                SSL_ERROR_WANT_READ)) {
+            goto end;
+        }
+    }
+    /* sesspre and sesspost should be different since the cipher changed. */
+    if (!TEST_false(SSL_renegotiate_pending(clientssl))
+            || !TEST_false(SSL_session_reused(clientssl))
+            || !TEST_false(SSL_session_reused(serverssl))
+            || !TEST_ptr(sesspost = SSL_get0_session(serverssl))
+            || !TEST_ptr_ne(sesspre, sesspost)
+            || !TEST_int_eq(TLS1_CK_RSA_WITH_AES_256_GCM_SHA384,
+                            SSL_CIPHER_get_id(SSL_get_current_cipher(clientssl))))
+        goto end;
+
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    testresult = 1;
+
+end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    SSL_SESSION_free(sess);
+
+    return testresult;
+}
 #endif
 
 static int execute_test_large_message(const SSL_METHOD *smeth,
@@ -577,14 +799,18 @@ static int execute_test_large_message(const SSL_METHOD *smeth,
 
     if (!TEST_ptr(certbio = BIO_new_file(cert, "r")))
         goto end;
-    chaincert = PEM_read_bio_X509(certbio, NULL, NULL, NULL);
-    BIO_free(certbio);
-    certbio = NULL;
-    if (!TEST_ptr(chaincert))
+
+    if (!TEST_ptr(chaincert = X509_new_with_libctx(libctx, NULL)))
         goto end;
 
-    if (!TEST_true(create_ssl_ctx_pair(smeth, cmeth, min_version, max_version,
-                                       &sctx, &cctx, cert, privkey)))
+    if (PEM_read_bio_X509(certbio, &chaincert, NULL, NULL) == NULL)
+        goto end;
+    BIO_free(certbio);
+    certbio = NULL;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, smeth, cmeth, min_version,
+                                       max_version, &sctx, &cctx, cert,
+                                       privkey)))
         goto end;
 
     if (read_ahead) {
@@ -622,13 +848,14 @@ static int execute_test_large_message(const SSL_METHOD *smeth,
 
     /*
      * Calling SSL_clear() first is not required but this tests that SSL_clear()
-     * doesn't leak (when using enable-crypto-mdebug).
+     * doesn't leak.
      */
     if (!TEST_true(SSL_clear(serverssl)))
         goto end;
 
     testresult = 1;
  end:
+    BIO_free(certbio);
     X509_free(chaincert);
     SSL_free(serverssl);
     SSL_free(clientssl);
@@ -638,18 +865,725 @@ static int execute_test_large_message(const SSL_METHOD *smeth,
     return testresult;
 }
 
+#if !defined(OPENSSL_NO_SOCK) && !defined(OPENSSL_NO_KTLS) && \
+    !(defined(OPENSSL_NO_TLS1_3) && defined(OPENSSL_NO_TLS1_2))
+#define TLS_CIPHER_MAX_REC_SEQ_SIZE 8
+/* sock must be connected */
+static int ktls_chk_platform(int sock)
+{
+    if (!ktls_enable(sock))
+        return 0;
+    return 1;
+}
+
+static int ping_pong_query(SSL *clientssl, SSL *serverssl, int cfd, int sfd, int rec_seq_size)
+{
+    static char count = 1;
+    unsigned char cbuf[16000] = {0};
+    unsigned char sbuf[16000];
+    size_t err = 0;
+    char crec_wseq_before[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char crec_wseq_after[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char crec_rseq_before[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char crec_rseq_after[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char srec_wseq_before[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char srec_wseq_after[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char srec_rseq_before[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+    char srec_rseq_after[TLS_CIPHER_MAX_REC_SEQ_SIZE];
+
+    cbuf[0] = count++;
+    memcpy(crec_wseq_before, &clientssl->rlayer.write_sequence, rec_seq_size);
+    memcpy(crec_rseq_before, &clientssl->rlayer.read_sequence, rec_seq_size);
+    memcpy(srec_wseq_before, &serverssl->rlayer.write_sequence, rec_seq_size);
+    memcpy(srec_rseq_before, &serverssl->rlayer.read_sequence, rec_seq_size);
+
+    if (!TEST_true(SSL_write(clientssl, cbuf, sizeof(cbuf)) == sizeof(cbuf)))
+        goto end;
+
+    while ((err = SSL_read(serverssl, &sbuf, sizeof(sbuf))) != sizeof(sbuf)) {
+        if (SSL_get_error(serverssl, err) != SSL_ERROR_WANT_READ) {
+            goto end;
+        }
+    }
+
+    if (!TEST_true(SSL_write(serverssl, sbuf, sizeof(sbuf)) == sizeof(sbuf)))
+        goto end;
+
+    while ((err = SSL_read(clientssl, &cbuf, sizeof(cbuf))) != sizeof(cbuf)) {
+        if (SSL_get_error(clientssl, err) != SSL_ERROR_WANT_READ) {
+            goto end;
+        }
+    }
+
+    memcpy(crec_wseq_after, &clientssl->rlayer.write_sequence, rec_seq_size);
+    memcpy(crec_rseq_after, &clientssl->rlayer.read_sequence, rec_seq_size);
+    memcpy(srec_wseq_after, &serverssl->rlayer.write_sequence, rec_seq_size);
+    memcpy(srec_rseq_after, &serverssl->rlayer.read_sequence, rec_seq_size);
+
+    /* verify the payload */
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), sbuf, sizeof(sbuf)))
+        goto end;
+
+    /* ktls is used then kernel sequences are used instead of OpenSSL sequences */
+    if (clientssl->mode & SSL_MODE_NO_KTLS_TX) {
+        if (!TEST_mem_ne(crec_wseq_before, rec_seq_size,
+                         crec_wseq_after, rec_seq_size))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(crec_wseq_before, rec_seq_size,
+                         crec_wseq_after, rec_seq_size))
+            goto end;
+    }
+
+    if (serverssl->mode & SSL_MODE_NO_KTLS_TX) {
+        if (!TEST_mem_ne(srec_wseq_before, rec_seq_size,
+                         srec_wseq_after, rec_seq_size))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(srec_wseq_before, rec_seq_size,
+                         srec_wseq_after, rec_seq_size))
+            goto end;
+    }
+
+    if (clientssl->mode & SSL_MODE_NO_KTLS_RX) {
+        if (!TEST_mem_ne(crec_rseq_before, rec_seq_size,
+                         crec_rseq_after, rec_seq_size))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(crec_rseq_before, rec_seq_size,
+                         crec_rseq_after, rec_seq_size))
+            goto end;
+    }
+
+    if (serverssl->mode & SSL_MODE_NO_KTLS_RX) {
+        if (!TEST_mem_ne(srec_rseq_before, rec_seq_size,
+                         srec_rseq_after, rec_seq_size))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(srec_rseq_before, rec_seq_size,
+                         srec_rseq_after, rec_seq_size))
+            goto end;
+    }
+
+    return 1;
+end:
+    return 0;
+}
+
+static int execute_test_ktls(int cis_ktls_tx, int cis_ktls_rx,
+                             int sis_ktls_tx, int sis_ktls_rx,
+                             int tls_version, const char *cipher,
+                             int rec_seq_size)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    int cfd, sfd;
+
+    if (!TEST_true(create_test_sockets(&cfd, &sfd)))
+        goto end;
+
+    /* Skip this test if the platform does not support ktls */
+    if (!ktls_chk_platform(cfd))
+        return 1;
+
+    /* Create a session based on SHA-256 */
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       tls_version, tls_version,
+                                       &sctx, &cctx, cert, privkey))
+            || !TEST_true(SSL_CTX_set_cipher_list(cctx, cipher))
+            || !TEST_true(create_ssl_objects2(sctx, cctx, &serverssl,
+                                          &clientssl, sfd, cfd)))
+        goto end;
+
+    if (!cis_ktls_tx) {
+        if (!TEST_true(SSL_set_mode(clientssl, SSL_MODE_NO_KTLS_TX)))
+            goto end;
+    }
+
+    if (!sis_ktls_tx) {
+        if (!TEST_true(SSL_set_mode(serverssl, SSL_MODE_NO_KTLS_TX)))
+            goto end;
+    }
+
+    if (!cis_ktls_rx) {
+        if (!TEST_true(SSL_set_mode(clientssl, SSL_MODE_NO_KTLS_RX)))
+            goto end;
+    }
+
+    if (!sis_ktls_rx) {
+        if (!TEST_true(SSL_set_mode(serverssl, SSL_MODE_NO_KTLS_RX)))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE)))
+        goto end;
+
+    if (!cis_ktls_tx) {
+        if (!TEST_false(BIO_get_ktls_send(clientssl->wbio)))
+            goto end;
+    } else {
+        if (!TEST_true(BIO_get_ktls_send(clientssl->wbio)))
+            goto end;
+    }
+
+    if (!sis_ktls_tx) {
+        if (!TEST_false(BIO_get_ktls_send(serverssl->wbio)))
+            goto end;
+    } else {
+        if (!TEST_true(BIO_get_ktls_send(serverssl->wbio)))
+            goto end;
+    }
+
+    if (!cis_ktls_rx) {
+        if (!TEST_false(BIO_get_ktls_recv(clientssl->rbio)))
+            goto end;
+    } else {
+        if (!TEST_true(BIO_get_ktls_recv(clientssl->rbio)))
+            goto end;
+    }
+
+    if (!sis_ktls_rx) {
+        if (!TEST_false(BIO_get_ktls_recv(serverssl->rbio)))
+            goto end;
+    } else {
+        if (!TEST_true(BIO_get_ktls_recv(serverssl->rbio)))
+            goto end;
+    }
+
+    if (!TEST_true(ping_pong_query(clientssl, serverssl, cfd, sfd,
+				   rec_seq_size)))
+        goto end;
+
+    testresult = 1;
+end:
+    if (clientssl) {
+        SSL_shutdown(clientssl);
+        SSL_free(clientssl);
+    }
+    if (serverssl) {
+        SSL_shutdown(serverssl);
+        SSL_free(serverssl);
+    }
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    serverssl = clientssl = NULL;
+    return testresult;
+}
+
+#define SENDFILE_SZ                     (16 * 4096)
+#define SENDFILE_CHUNK                  (4 * 4096)
+#define min(a,b)                        ((a) > (b) ? (b) : (a))
+
+static int test_ktls_sendfile(int tls_version, const char *cipher)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    unsigned char *buf, *buf_dst;
+    BIO *out = NULL, *in = NULL;
+    int cfd, sfd, ffd, err;
+    ssize_t chunk_size = 0;
+    off_t chunk_off = 0;
+    int testresult = 0;
+    FILE *ffdp;
+
+    buf = OPENSSL_zalloc(SENDFILE_SZ);
+    buf_dst = OPENSSL_zalloc(SENDFILE_SZ);
+    if (!TEST_ptr(buf) || !TEST_ptr(buf_dst)
+        || !TEST_true(create_test_sockets(&cfd, &sfd)))
+        goto end;
+
+    /* Skip this test if the platform does not support ktls */
+    if (!ktls_chk_platform(sfd)) {
+        testresult = 1;
+        goto end;
+    }
+
+    /* Create a session based on SHA-256 */
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       tls_version, tls_version,
+                                       &sctx, &cctx, cert, privkey))
+        || !TEST_true(SSL_CTX_set_cipher_list(cctx, cipher))
+        || !TEST_true(create_ssl_objects2(sctx, cctx, &serverssl,
+                                          &clientssl, sfd, cfd)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                         SSL_ERROR_NONE))
+        || !TEST_true(BIO_get_ktls_send(serverssl->wbio)))
+        goto end;
+
+    RAND_bytes(buf, SENDFILE_SZ);
+    out = BIO_new_file(tmpfilename, "wb");
+    if (!TEST_ptr(out))
+        goto end;
+
+    if (BIO_write(out, buf, SENDFILE_SZ) != SENDFILE_SZ)
+        goto end;
+
+    BIO_free(out);
+    out = NULL;
+    in = BIO_new_file(tmpfilename, "rb");
+    BIO_get_fp(in, &ffdp);
+    ffd = fileno(ffdp);
+
+    while (chunk_off < SENDFILE_SZ) {
+        chunk_size = min(SENDFILE_CHUNK, SENDFILE_SZ - chunk_off);
+        while ((err = SSL_sendfile(serverssl,
+                                   ffd,
+                                   chunk_off,
+                                   chunk_size,
+                                   0)) != chunk_size) {
+            if (SSL_get_error(serverssl, err) != SSL_ERROR_WANT_WRITE)
+                goto end;
+        }
+        while ((err = SSL_read(clientssl,
+                               buf_dst + chunk_off,
+                               chunk_size)) != chunk_size) {
+            if (SSL_get_error(clientssl, err) != SSL_ERROR_WANT_READ)
+                goto end;
+        }
+
+        /* verify the payload */
+        if (!TEST_mem_eq(buf_dst + chunk_off,
+                         chunk_size,
+                         buf + chunk_off,
+                         chunk_size))
+            goto end;
+
+        chunk_off += chunk_size;
+    }
+
+    testresult = 1;
+end:
+    if (clientssl) {
+        SSL_shutdown(clientssl);
+        SSL_free(clientssl);
+    }
+    if (serverssl) {
+        SSL_shutdown(serverssl);
+        SSL_free(serverssl);
+    }
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    serverssl = clientssl = NULL;
+    BIO_free(out);
+    BIO_free(in);
+    OPENSSL_free(buf);
+    OPENSSL_free(buf_dst);
+    return testresult;
+}
+
+static int test_ktls_no_txrx_client_no_txrx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 0, 0, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 0, 0, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 0, 0, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_rx_client_no_txrx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 0, 0, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 0, 0, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 0, 0, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_tx_client_no_txrx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 1, 0, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 1, 0, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 1, 0, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_client_no_txrx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 1, 0, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 1, 0, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 1, 0, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_txrx_client_no_rx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 0, 1, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 0, 1, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 0, 1, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_rx_client_no_rx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 0, 1, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 0, 1, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 0, 1, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_tx_client_no_rx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 1, 1, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 1, 1, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 1, 1, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_client_no_rx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 1, 1, 0, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 1, 1, 0, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 1, 1, 0, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_txrx_client_no_tx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 0, 0, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 0, 0, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 0, 0, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_rx_client_no_tx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 0, 0, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 0, 0, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 0, 0, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_tx_client_no_tx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 1, 0, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 1, 0, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 1, 0, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_client_no_tx_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 1, 0, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 1, 0, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 1, 0, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_txrx_client_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 0, 1, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 0, 1, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 0, 1, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_rx_client_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 0, 1, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 0, 1, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 0, 1, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_no_tx_client_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(0, 1, 1, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(0, 1, 1, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(0, 1, 1, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+static int test_ktls_client_server(int tlsver)
+{
+    int testresult = 1;
+
+#ifdef OPENSSL_KTLS_AES_GCM_128
+    testresult &= execute_test_ktls(1, 1, 1, 1, tlsver,
+         "AES128-GCM-SHA256", TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_CCM_128
+    testresult &= execute_test_ktls(1, 1, 1, 1, tlsver,
+         "AES128-CCM-SHA256", TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE);
+#endif
+#ifdef OPENSSL_KTLS_AES_GCM_256
+    testresult &= execute_test_ktls(1, 1, 1, 1, tlsver,
+         "AES256-GCM-SHA384", TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+#endif
+    return testresult;
+}
+
+#if !defined(OPENSSL_NO_TLS1_2) || !defined(OPENSSL_NO_TLS1_3)
+static int test_ktls(int test)
+{
+    int tlsver;
+
+    if (test > 15) {
+#if defined(OPENSSL_NO_TLS1_3)
+        return 1;
+#else
+        test -= 16;
+        tlsver = TLS1_3_VERSION;
+#endif
+    } else {
+#if defined(OPENSSL_NO_TLS1_2)
+        return 1;
+#else
+        tlsver = TLS1_2_VERSION;
+#endif
+    }
+
+    switch(test) {
+    case 0:
+       return test_ktls_no_txrx_client_no_txrx_server(tlsver);
+    case 1:
+       return test_ktls_no_rx_client_no_txrx_server(tlsver);
+    case 2:
+       return test_ktls_no_tx_client_no_txrx_server(tlsver);
+    case 3:
+       return test_ktls_client_no_txrx_server(tlsver);
+    case 4:
+       return test_ktls_no_txrx_client_no_rx_server(tlsver);
+    case 5:
+       return test_ktls_no_rx_client_no_rx_server(tlsver);
+    case 6:
+       return test_ktls_no_tx_client_no_rx_server(tlsver);
+    case 7:
+       return test_ktls_client_no_rx_server(tlsver);
+    case 8:
+       return test_ktls_no_txrx_client_no_tx_server(tlsver);
+    case 9:
+       return test_ktls_no_rx_client_no_tx_server(tlsver);
+    case 10:
+       return test_ktls_no_tx_client_no_tx_server(tlsver);
+    case 11:
+       return test_ktls_client_no_tx_server(tlsver);
+    case 12:
+       return test_ktls_no_txrx_client_server(tlsver);
+    case 13:
+       return test_ktls_no_rx_client_server(tlsver);
+    case 14:
+       return test_ktls_no_tx_client_server(tlsver);
+    case 15:
+       return test_ktls_client_server(tlsver);
+    default:
+       return 0;
+    }
+}
+
+static int test_ktls_sendfile_anytls(int tst)
+{
+    char *cipher[] = {"AES128-GCM-SHA256","AES128-CCM-SHA256","AES256-GCM-SHA384"};
+    int tlsver;
+
+    if (tst > 2) {
+#if defined(OPENSSL_NO_TLS1_3)
+        return 1;
+#else
+        tst -= 3;
+        tlsver = TLS1_3_VERSION;
+#endif
+    } else {
+#if defined(OPENSSL_NO_TLS1_2)
+        return 1;
+#else
+        tlsver = TLS1_2_VERSION;
+#endif
+    }
+
+#ifndef OPENSSL_KTLS_AES_GCM_128
+   if(tst == 0) return 1;
+#endif
+#ifndef OPENSSL_KTLS_AES_CCM_128
+   if(tst == 1) return 1;
+#endif
+#ifndef OPENSSL_KTLS_AES_GCM_256
+   if(tst == 2) return 1;
+#endif
+   return test_ktls_sendfile(tlsver, cipher[tst]);
+}
+
+#endif
+#endif
+
 static int test_large_message_tls(void)
 {
     return execute_test_large_message(TLS_server_method(), TLS_client_method(),
-                                      TLS1_VERSION, TLS_MAX_VERSION,
-                                      0);
+                                      TLS1_VERSION, 0, 0);
 }
 
 static int test_large_message_tls_read_ahead(void)
 {
     return execute_test_large_message(TLS_server_method(), TLS_client_method(),
-                                      TLS1_VERSION, TLS_MAX_VERSION,
-                                      1);
+                                      TLS1_VERSION, 0, 1);
 }
 
 #ifndef OPENSSL_NO_DTLS
@@ -661,10 +1595,122 @@ static int test_large_message_dtls(void)
      */
     return execute_test_large_message(DTLS_server_method(),
                                       DTLS_client_method(),
-                                      DTLS1_VERSION, DTLS_MAX_VERSION,
-                                      0);
+                                      DTLS1_VERSION, 0, 0);
 }
 #endif
+
+static int execute_cleanse_plaintext(const SSL_METHOD *smeth,
+                                     const SSL_METHOD *cmeth,
+                                     int min_version, int max_version)
+{
+    size_t i;
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    SSL3_RECORD *rr;
+    void *zbuf;
+
+    static unsigned char cbuf[16000];
+    static unsigned char sbuf[16000];
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx,
+                                       smeth, cmeth,
+                                       min_version, max_version,
+                                       &sctx, &cctx, cert,
+                                       privkey)))
+        goto end;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(SSL_set_options(serverssl, SSL_OP_CLEANSE_PLAINTEXT)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                         SSL_ERROR_NONE)))
+        goto end;
+
+    for (i = 0; i < sizeof(cbuf); i++) {
+        cbuf[i] = i & 0xff;
+    }
+
+    if (!TEST_int_eq(SSL_write(clientssl, cbuf, sizeof(cbuf)), sizeof(cbuf)))
+        goto end;
+
+    if (!TEST_int_eq(SSL_peek(serverssl, &sbuf, sizeof(sbuf)), sizeof(sbuf)))
+        goto end;
+
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), sbuf, sizeof(sbuf)))
+        goto end;
+
+    /*
+     * Since we called SSL_peek(), we know the data in the record
+     * layer is a plaintext record. We can gather the pointer to check
+     * for zeroization after SSL_read().
+     */
+    rr = serverssl->rlayer.rrec;
+    zbuf = &rr->data[rr->off];
+    if (!TEST_int_eq(rr->length, sizeof(cbuf)))
+        goto end;
+
+    /*
+     * After SSL_peek() the plaintext must still be stored in the
+     * record.
+     */
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), zbuf, sizeof(cbuf)))
+        goto end;
+
+    memset(sbuf, 0, sizeof(sbuf));
+    if (!TEST_int_eq(SSL_read(serverssl, &sbuf, sizeof(sbuf)), sizeof(sbuf)))
+        goto end;
+
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), sbuf, sizeof(cbuf)))
+        goto end;
+
+    /* Check if rbuf is cleansed */
+    memset(cbuf, 0, sizeof(cbuf));
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), zbuf, sizeof(cbuf)))
+        goto end;
+
+    testresult = 1;
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+static int test_cleanse_plaintext(void)
+{
+#if !defined(OPENSSL_NO_TLS1_2)
+    if (!TEST_true(execute_cleanse_plaintext(TLS_server_method(),
+                                             TLS_client_method(),
+                                             TLS1_2_VERSION,
+                                             TLS1_2_VERSION)))
+        return 0;
+
+#endif
+
+#if !defined(OPENSSL_NO_TLS1_3)
+    if (!TEST_true(execute_cleanse_plaintext(TLS_server_method(),
+                                             TLS_client_method(),
+                                             TLS1_3_VERSION,
+                                             TLS1_3_VERSION)))
+        return 0;
+#endif
+
+#if !defined(OPENSSL_NO_DTLS)
+    if (!TEST_true(execute_cleanse_plaintext(DTLS_server_method(),
+                                             DTLS_client_method(),
+                                             DTLS1_VERSION,
+                                             0)))
+        return 0;
+#endif
+    return 1;
+}
 
 #ifndef OPENSSL_NO_OCSP
 static int ocsp_server_cb(SSL *s, void *arg)
@@ -681,7 +1727,7 @@ static int ocsp_server_cb(SSL *s, void *arg)
             return SSL_TLSEXT_ERR_ALERT_FATAL;
 
         id = sk_OCSP_RESPID_value(ids, 0);
-        if (id == NULL || !OCSP_RESPID_match(id, ocspcert))
+        if (id == NULL || !OCSP_RESPID_match_ex(id, ocspcert, libctx, NULL))
             return SSL_TLSEXT_ERR_ALERT_FATAL;
     } else if (*argi != 1) {
         return SSL_TLSEXT_ERR_ALERT_FATAL;
@@ -721,8 +1767,8 @@ static int test_tlsext_status_type(void)
     OCSP_RESPID *id = NULL;
     BIO *certbio = NULL;
 
-    if (!create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                             TLS1_VERSION, TLS_MAX_VERSION,
+    if (!create_ssl_ctx_pair(libctx, TLS_server_method(), TLS_client_method(),
+                             TLS1_VERSION, 0,
                              &sctx, &cctx, cert, privkey))
         return 0;
 
@@ -807,9 +1853,9 @@ static int test_tlsext_status_type(void)
     if (!TEST_ptr(certbio = BIO_new_file(cert, "r"))
             || !TEST_ptr(id = OCSP_RESPID_new())
             || !TEST_ptr(ids = sk_OCSP_RESPID_new_null())
-            || !TEST_ptr(ocspcert = PEM_read_bio_X509(certbio,
-                                                      NULL, NULL, NULL))
-            || !TEST_true(OCSP_RESPID_set_by_key(id, ocspcert))
+            || !TEST_ptr(ocspcert = X509_new_with_libctx(libctx, NULL))
+            || !TEST_ptr(PEM_read_bio_X509(certbio, &ocspcert, NULL, NULL))
+            || !TEST_true(OCSP_RESPID_set_by_key_ex(id, ocspcert, libctx, NULL))
             || !TEST_true(sk_OCSP_RESPID_push(ids, id)))
         goto end;
     id = NULL;
@@ -873,7 +1919,7 @@ static SSL_SESSION *get_session_cb(SSL *ssl, const unsigned char *id, int len,
 }
 
 static int execute_test_session(int maxprot, int use_int_cache,
-                                int use_ext_cache)
+                                int use_ext_cache, long s_options)
 {
     SSL_CTX *sctx = NULL, *cctx = NULL;
     SSL *serverssl1 = NULL, *clientssl1 = NULL;
@@ -890,8 +1936,8 @@ static int execute_test_session(int maxprot, int use_int_cache,
     if (maxprot == TLS1_3_VERSION)
         numnewsesstick = 2;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         return 0;
 
@@ -914,6 +1960,10 @@ static int execute_test_session(int maxprot, int use_int_cache,
         SSL_CTX_set_session_cache_mode(cctx,
                                        SSL_SESS_CACHE_CLIENT
                                        | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    }
+
+    if (s_options) {
+        SSL_CTX_set_options(sctx, s_options);
     }
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl1, &clientssl1,
@@ -944,11 +1994,12 @@ static int execute_test_session(int maxprot, int use_int_cache,
     if (maxprot == TLS1_3_VERSION) {
         /*
          * In TLSv1.3 we should have created a new session even though we have
-         * resumed.
+         * resumed. Since we attempted a resume we should also have removed the
+         * old ticket from the cache so that we try to only use tickets once.
          */
         if (use_ext_cache
                 && (!TEST_int_eq(new_called, 1)
-                    || !TEST_int_eq(remove_called, 0)))
+                    || !TEST_int_eq(remove_called, 1)))
             goto end;
     } else {
         /*
@@ -1062,7 +2113,8 @@ static int execute_test_session(int maxprot, int use_int_cache,
     sess2 = NULL;
 
     SSL_CTX_set_max_proto_version(sctx, maxprot);
-    SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET);
+    if (maxprot == TLS1_2_VERSION)
+        SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET);
     new_called = remove_called = get_called = 0;
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl1, &clientssl1,
                                       NULL, NULL))
@@ -1158,12 +2210,12 @@ static int execute_test_session(int maxprot, int use_int_cache,
 static int test_session_with_only_int_cache(void)
 {
 #ifndef OPENSSL_NO_TLS1_3
-    if (!execute_test_session(TLS1_3_VERSION, 1, 0))
+    if (!execute_test_session(TLS1_3_VERSION, 1, 0, 0))
         return 0;
 #endif
 
 #ifndef OPENSSL_NO_TLS1_2
-    return execute_test_session(TLS1_2_VERSION, 1, 0);
+    return execute_test_session(TLS1_2_VERSION, 1, 0, 0);
 #else
     return 1;
 #endif
@@ -1172,12 +2224,12 @@ static int test_session_with_only_int_cache(void)
 static int test_session_with_only_ext_cache(void)
 {
 #ifndef OPENSSL_NO_TLS1_3
-    if (!execute_test_session(TLS1_3_VERSION, 0, 1))
+    if (!execute_test_session(TLS1_3_VERSION, 0, 1, 0))
         return 0;
 #endif
 
 #ifndef OPENSSL_NO_TLS1_2
-    return execute_test_session(TLS1_2_VERSION, 0, 1);
+    return execute_test_session(TLS1_2_VERSION, 0, 1, 0);
 #else
     return 1;
 #endif
@@ -1186,16 +2238,31 @@ static int test_session_with_only_ext_cache(void)
 static int test_session_with_both_cache(void)
 {
 #ifndef OPENSSL_NO_TLS1_3
-    if (!execute_test_session(TLS1_3_VERSION, 1, 1))
+    if (!execute_test_session(TLS1_3_VERSION, 1, 1, 0))
         return 0;
 #endif
 
 #ifndef OPENSSL_NO_TLS1_2
-    return execute_test_session(TLS1_2_VERSION, 1, 1);
+    return execute_test_session(TLS1_2_VERSION, 1, 1, 0);
 #else
     return 1;
 #endif
 }
+
+static int test_session_wo_ca_names(void)
+{
+#ifndef OPENSSL_NO_TLS1_3
+    if (!execute_test_session(TLS1_3_VERSION, 1, 0, SSL_OP_DISABLE_TLSEXT_CA_NAMES))
+        return 0;
+#endif
+
+#ifndef OPENSSL_NO_TLS1_2
+    return execute_test_session(TLS1_2_VERSION, 1, 0, SSL_OP_DISABLE_TLSEXT_CA_NAMES);
+#else
+    return 1;
+#endif
+}
+
 
 #ifndef OPENSSL_NO_TLS1_3
 static SSL_SESSION *sesscache[6];
@@ -1231,11 +2298,92 @@ static int post_handshake_verify(SSL *sssl, SSL *cssl)
     return 1;
 }
 
-static int test_tickets(int idx)
+static int setup_ticket_test(int stateful, int idx, SSL_CTX **sctx,
+                             SSL_CTX **cctx)
+{
+    int sess_id_ctx = 1;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
+                                       sctx, cctx, cert, privkey))
+            || !TEST_true(SSL_CTX_set_num_tickets(*sctx, idx))
+            || !TEST_true(SSL_CTX_set_session_id_context(*sctx,
+                                                         (void *)&sess_id_ctx,
+                                                         sizeof(sess_id_ctx))))
+        return 0;
+
+    if (stateful)
+        SSL_CTX_set_options(*sctx, SSL_OP_NO_TICKET);
+
+    SSL_CTX_set_session_cache_mode(*cctx, SSL_SESS_CACHE_CLIENT
+                                          | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(*cctx, new_cachesession_cb);
+
+    return 1;
+}
+
+static int check_resumption(int idx, SSL_CTX *sctx, SSL_CTX *cctx, int succ)
+{
+    SSL *serverssl = NULL, *clientssl = NULL;
+    int i;
+
+    /* Test that we can resume with all the tickets we got given */
+    for (i = 0; i < idx * 2; i++) {
+        new_called = 0;
+        if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
+                                              &clientssl, NULL, NULL))
+                || !TEST_true(SSL_set_session(clientssl, sesscache[i])))
+            goto end;
+
+        SSL_set_post_handshake_auth(clientssl, 1);
+
+        if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                    SSL_ERROR_NONE)))
+            goto end;
+
+        /*
+         * Following a successful resumption we only get 1 ticket. After a
+         * failed one we should get idx tickets.
+         */
+        if (succ) {
+            if (!TEST_true(SSL_session_reused(clientssl))
+                    || !TEST_int_eq(new_called, 1))
+                goto end;
+        } else {
+            if (!TEST_false(SSL_session_reused(clientssl))
+                    || !TEST_int_eq(new_called, idx))
+                goto end;
+        }
+
+        new_called = 0;
+        /* After a post-handshake authentication we should get 1 new ticket */
+        if (succ
+                && (!post_handshake_verify(serverssl, clientssl)
+                    || !TEST_int_eq(new_called, 1)))
+            goto end;
+
+        SSL_shutdown(clientssl);
+        SSL_shutdown(serverssl);
+        SSL_free(serverssl);
+        SSL_free(clientssl);
+        serverssl = clientssl = NULL;
+        SSL_SESSION_free(sesscache[i]);
+        sesscache[i] = NULL;
+    }
+
+    return 1;
+
+ end:
+    SSL_free(clientssl);
+    SSL_free(serverssl);
+    return 0;
+}
+
+static int test_tickets(int stateful, int idx)
 {
     SSL_CTX *sctx = NULL, *cctx = NULL;
     SSL *serverssl = NULL, *clientssl = NULL;
-    int testresult = 0, i;
+    int testresult = 0;
     size_t j;
 
     /* idx is the test number, but also the number of tickets we want */
@@ -1243,21 +2391,58 @@ static int test_tickets(int idx)
     new_called = 0;
     do_cache = 1;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION, &sctx,
-                                       &cctx, cert, privkey))
-            || !TEST_true(SSL_CTX_set_num_tickets(sctx, idx)))
+    if (!setup_ticket_test(stateful, idx, &sctx, &cctx))
         goto end;
-
-    SSL_CTX_set_session_cache_mode(cctx, SSL_SESS_CACHE_CLIENT
-                                         | SSL_SESS_CACHE_NO_INTERNAL_STORE);
-    SSL_CTX_sess_set_new_cb(cctx, new_cachesession_cb);
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
                                           &clientssl, NULL, NULL)))
         goto end;
 
-    SSL_force_post_handshake_auth(clientssl);
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+               /* Check we got the number of tickets we were expecting */
+            || !TEST_int_eq(idx, new_called))
+        goto end;
+
+    SSL_shutdown(clientssl);
+    SSL_shutdown(serverssl);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    clientssl = serverssl = NULL;
+    sctx = cctx = NULL;
+
+    /*
+     * Now we try to resume with the tickets we previously created. The
+     * resumption attempt is expected to fail (because we're now using a new
+     * SSL_CTX). We should see idx number of tickets issued again.
+     */
+
+    /* Stop caching sessions - just count them */
+    do_cache = 0;
+
+    if (!setup_ticket_test(stateful, idx, &sctx, &cctx))
+        goto end;
+
+    if (!check_resumption(idx, sctx, cctx, 0))
+        goto end;
+
+    /* Start again with caching sessions */
+    new_called = 0;
+    do_cache = 1;
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    sctx = cctx = NULL;
+
+    if (!setup_ticket_test(stateful, idx, &sctx, &cctx))
+        goto end;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
+                                          &clientssl, NULL, NULL)))
+        goto end;
+
+    SSL_set_post_handshake_auth(clientssl, 1);
 
     if (!TEST_true(create_ssl_connection(serverssl, clientssl,
                                                 SSL_ERROR_NONE))
@@ -1279,37 +2464,12 @@ static int test_tickets(int idx)
     /* Stop caching sessions - just count them */
     do_cache = 0;
 
-    /* Test that we can resume with all the tickets we got given */
-    for (i = 0; i < idx * 2; i++) {
-        new_called = 0;
-        if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
-                                              &clientssl, NULL, NULL))
-                || !TEST_true(SSL_set_session(clientssl, sesscache[i])))
-            goto end;
-
-        SSL_force_post_handshake_auth(clientssl);
-
-        if (!TEST_true(create_ssl_connection(serverssl, clientssl,
-                                                    SSL_ERROR_NONE))
-                || !TEST_true(SSL_session_reused(clientssl))
-                   /* Following a resumption we only get 1 ticket */
-                || !TEST_int_eq(new_called, 1))
-            goto end;
-
-        new_called = 0;
-        /* After a post-handshake authentication we should get 1 new ticket */
-        if (!post_handshake_verify(serverssl, clientssl)
-                || !TEST_int_eq(new_called, 1))
-            goto end;
-
-        SSL_shutdown(clientssl);
-        SSL_shutdown(serverssl);
-        SSL_free(serverssl);
-        SSL_free(clientssl);
-        serverssl = clientssl = NULL;
-        SSL_SESSION_free(sesscache[i]);
-        sesscache[i] = NULL;
-    }
+    /*
+     * Check we can resume with all the tickets we created. This time around the
+     * resumptions should all be successful.
+     */
+    if (!check_resumption(idx, sctx, cctx, 1))
+        goto end;
 
     testresult = 1;
 
@@ -1323,6 +2483,213 @@ static int test_tickets(int idx)
     SSL_CTX_free(sctx);
     SSL_CTX_free(cctx);
 
+    return testresult;
+}
+
+static int test_stateless_tickets(int idx)
+{
+    return test_tickets(0, idx);
+}
+
+static int test_stateful_tickets(int idx)
+{
+    return test_tickets(1, idx);
+}
+
+static int test_psk_tickets(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    int testresult = 0;
+    int sess_id_ctx = 1;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
+                                       &sctx, &cctx, NULL, NULL))
+            || !TEST_true(SSL_CTX_set_session_id_context(sctx,
+                                                         (void *)&sess_id_ctx,
+                                                         sizeof(sess_id_ctx))))
+        goto end;
+
+    SSL_CTX_set_session_cache_mode(cctx, SSL_SESS_CACHE_CLIENT
+                                         | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_set_psk_use_session_callback(cctx, use_session_cb);
+    SSL_CTX_set_psk_find_session_callback(sctx, find_session_cb);
+    SSL_CTX_sess_set_new_cb(cctx, new_session_cb);
+    use_session_cb_cnt = 0;
+    find_session_cb_cnt = 0;
+    srvid = pskid;
+    new_called = 0;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL)))
+        goto end;
+    clientpsk = serverpsk = create_a_psk(clientssl);
+    if (!TEST_ptr(clientpsk))
+        goto end;
+    SSL_SESSION_up_ref(clientpsk);
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+            || !TEST_int_eq(1, find_session_cb_cnt)
+            || !TEST_int_eq(1, use_session_cb_cnt)
+               /* We should always get 1 ticket when using external PSK */
+            || !TEST_int_eq(1, new_called))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+
+    return testresult;
+}
+
+static int test_extra_tickets(int idx)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    BIO *bretry = BIO_new(bio_s_always_retry());
+    BIO *tmp = NULL;
+    int testresult = 0;
+    int stateful = 0;
+    size_t nbytes;
+    unsigned char c, buf[1];
+
+    new_called = 0;
+    do_cache = 1;
+
+    if (idx >= 3) {
+        idx -= 3;
+        stateful = 1;
+    }
+
+    if (!TEST_ptr(bretry) || !setup_ticket_test(stateful, idx, &sctx, &cctx))
+        goto end;
+    SSL_CTX_sess_set_new_cb(sctx, new_session_cb);
+    /* setup_ticket_test() uses new_cachesession_cb which we don't need. */
+    SSL_CTX_sess_set_new_cb(cctx, new_session_cb);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
+                                          &clientssl, NULL, NULL)))
+        goto end;
+
+    /*
+     * Note that we have new_session_cb on both sctx and cctx, so new_called is
+     * incremented by both client and server.
+     */
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE))
+               /* Check we got the number of tickets we were expecting */
+            || !TEST_int_eq(idx * 2, new_called)
+            || !TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_int_eq(idx * 2, new_called))
+        goto end;
+
+    /* Now try a (real) write to actually send the tickets */
+    c = '1';
+    if (!TEST_true(SSL_write_ex(serverssl, &c, 1, &nbytes))
+            || !TEST_size_t_eq(1, nbytes)
+            || !TEST_int_eq(idx * 2 + 2, new_called)
+            || !TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes))
+            || !TEST_int_eq(idx * 2 + 4, new_called)
+            || !TEST_int_eq(sizeof(buf), nbytes)
+            || !TEST_int_eq(c, buf[0])
+            || !TEST_false(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes)))
+        goto end;
+
+    /* Try with only requesting one new ticket, too */
+    c = '2';
+    new_called = 0;
+    if (!TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_true(SSL_write_ex(serverssl, &c, sizeof(c), &nbytes))
+            || !TEST_size_t_eq(sizeof(c), nbytes)
+            || !TEST_int_eq(1, new_called)
+            || !TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes))
+            || !TEST_int_eq(2, new_called)
+            || !TEST_size_t_eq(sizeof(buf), nbytes)
+            || !TEST_int_eq(c, buf[0]))
+        goto end;
+
+    /* Do it again but use dummy writes to drive the ticket generation */
+    c = '3';
+    new_called = 0;
+    if (!TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_true(SSL_write_ex(serverssl, &c, 0, &nbytes))
+            || !TEST_size_t_eq(0, nbytes)
+            || !TEST_int_eq(2, new_called)
+            || !TEST_false(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes))
+            || !TEST_int_eq(4, new_called))
+        goto end;
+
+    /*
+     * Use the always-retry BIO to exercise the logic that forces ticket
+     * generation to wait until a record boundary.
+     */
+    c = '4';
+    new_called = 0;
+    tmp = SSL_get_wbio(serverssl);
+    if (!TEST_ptr(tmp) || !TEST_true(BIO_up_ref(tmp))) {
+        tmp = NULL;
+        goto end;
+    }
+    SSL_set0_wbio(serverssl, bretry);
+    bretry = NULL;
+    if (!TEST_false(SSL_write_ex(serverssl, &c, 1, &nbytes))
+            || !TEST_int_eq(SSL_get_error(serverssl, 0), SSL_ERROR_WANT_WRITE)
+            || !TEST_size_t_eq(nbytes, 0))
+        goto end;
+    /* Restore a BIO that will let the write succeed */
+    SSL_set0_wbio(serverssl, tmp);
+    tmp = NULL;
+    /* These calls should just queue the request and not send anything. */
+    if (!TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_true(SSL_new_session_ticket(serverssl))
+            || !TEST_int_eq(0, new_called))
+        goto end;
+    /* Re-do the write; still no tickets sent */
+    if (!TEST_true(SSL_write_ex(serverssl, &c, 1, &nbytes))
+            || !TEST_size_t_eq(1, nbytes)
+            || !TEST_int_eq(0, new_called)
+            || !TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes))
+            || !TEST_int_eq(0, new_called)
+            || !TEST_int_eq(sizeof(buf), nbytes)
+            || !TEST_int_eq(c, buf[0])
+            || !TEST_false(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes)))
+        goto end;
+    /* Now the *next* write should send the tickets */
+    c = '5';
+    if (!TEST_true(SSL_write_ex(serverssl, &c, 1, &nbytes))
+            || !TEST_size_t_eq(1, nbytes)
+            || !TEST_int_eq(2, new_called)
+            || !TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes))
+            || !TEST_int_eq(4, new_called)
+            || !TEST_int_eq(sizeof(buf), nbytes)
+            || !TEST_int_eq(c, buf[0])
+            || !TEST_false(SSL_read_ex(clientssl, buf, sizeof(buf), &nbytes)))
+        goto end;
+
+    SSL_shutdown(clientssl);
+    SSL_shutdown(serverssl);
+    testresult = 1;
+
+ end:
+    BIO_free(bretry);
+    BIO_free(tmp);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    clientssl = serverssl = NULL;
+    sctx = cctx = NULL;
     return testresult;
 }
 #endif
@@ -1404,8 +2771,8 @@ static int test_ssl_set_bio(int idx)
         conntype = idx % 2;
     }
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
 
@@ -1490,8 +2857,7 @@ static int test_ssl_set_bio(int idx)
     /*
      * This test is checking that the ref counting for SSL_set_bio is correct.
      * If we get here and we did too many frees then we will fail in the above
-     * functions. If we haven't done enough then this will only be detected in
-     * a crypto-mdebug build
+     * functions.
      */
     SSL_free(serverssl);
     SSL_free(clientssl);
@@ -1509,7 +2875,7 @@ static int execute_test_ssl_bio(int pop_ssl, bio_change_t change_bio)
     SSL *ssl = NULL;
     int testresult = 0;
 
-    if (!TEST_ptr(ctx = SSL_CTX_new(TLS_method()))
+    if (!TEST_ptr(ctx = SSL_CTX_new_with_libctx(libctx, NULL, TLS_method()))
             || !TEST_ptr(ssl = SSL_new(ctx))
             || !TEST_ptr(sslbio = BIO_new(BIO_f_ssl()))
             || !TEST_ptr(membio1 = BIO_new(BIO_s_mem())))
@@ -1518,8 +2884,7 @@ static int execute_test_ssl_bio(int pop_ssl, bio_change_t change_bio)
     BIO_set_ssl(sslbio, ssl, BIO_CLOSE);
 
     /*
-     * If anything goes wrong here then we could leak memory, so this will
-     * be caught in a crypto-mdebug build
+     * If anything goes wrong here then we could leak memory.
      */
     BIO_push(sslbio, membio1);
 
@@ -1629,8 +2994,8 @@ static int test_set_sigalgs(int idx)
     curr = testctx ? &testsigalgs[idx]
                    : &testsigalgs[idx - OSSL_NELEM(testsigalgs)];
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         return 0;
 
@@ -1701,14 +3066,6 @@ static int test_set_sigalgs(int idx)
 #endif
 
 #ifndef OPENSSL_NO_TLS1_3
-
-static SSL_SESSION *clientpsk = NULL;
-static SSL_SESSION *serverpsk = NULL;
-static const char *pskid = "Identity";
-static const char *srvid;
-
-static int use_session_cb_cnt = 0;
-static int find_session_cb_cnt = 0;
 static int psk_client_cb_cnt = 0;
 static int psk_server_cb_cnt = 0;
 
@@ -1836,8 +3193,40 @@ static unsigned int psk_server_cb(SSL *ssl, const char *identity,
 #define MSG6    "test"
 #define MSG7    "message."
 
-#define TLS13_AES_256_GCM_SHA384_BYTES  ((const unsigned char *)"\x13\x02")
 #define TLS13_AES_128_GCM_SHA256_BYTES  ((const unsigned char *)"\x13\x01")
+#define TLS13_AES_256_GCM_SHA384_BYTES  ((const unsigned char *)"\x13\x02")
+#define TLS13_CHACHA20_POLY1305_SHA256_BYTES ((const unsigned char *)"\x13\x03")
+#define TLS13_AES_128_CCM_SHA256_BYTES ((const unsigned char *)"\x13\x04")
+#define TLS13_AES_128_CCM_8_SHA256_BYTES ((const unsigned char *)"\x13\05")
+
+
+static SSL_SESSION *create_a_psk(SSL *ssl)
+{
+    const SSL_CIPHER *cipher = NULL;
+    const unsigned char key[] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+        0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
+        0x2c, 0x2d, 0x2e, 0x2f
+    };
+    SSL_SESSION *sess = NULL;
+
+    cipher = SSL_CIPHER_find(ssl, TLS13_AES_256_GCM_SHA384_BYTES);
+    sess = SSL_SESSION_new();
+    if (!TEST_ptr(sess)
+            || !TEST_ptr(cipher)
+            || !TEST_true(SSL_SESSION_set1_master_key(sess, key,
+                                                      sizeof(key)))
+            || !TEST_true(SSL_SESSION_set_cipher(sess, cipher))
+            || !TEST_true(
+                    SSL_SESSION_set_protocol_version(sess,
+                                                     TLS1_3_VERSION))) {
+        SSL_SESSION_free(sess);
+        return NULL;
+    }
+    return sess;
+}
 
 /*
  * Helper method to setup objects for early data test. Caller frees objects on
@@ -1846,11 +3235,14 @@ static unsigned int psk_server_cb(SSL *ssl, const char *identity,
 static int setupearly_data_test(SSL_CTX **cctx, SSL_CTX **sctx, SSL **clientssl,
                                 SSL **serverssl, SSL_SESSION **sess, int idx)
 {
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
-                                       sctx, cctx, cert, privkey))
-        || !TEST_true(SSL_CTX_set_max_early_data(*sctx,
-                                                 SSL3_RT_MAX_PLAIN_LENGTH)))
+    if (*sctx == NULL
+            && !TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                              TLS_client_method(),
+                                              TLS1_VERSION, 0,
+                                              sctx, cctx, cert, privkey)))
+        return 0;
+
+    if (!TEST_true(SSL_CTX_set_max_early_data(*sctx, SSL3_RT_MAX_PLAIN_LENGTH)))
         return 0;
 
     if (idx == 1) {
@@ -1881,26 +3273,8 @@ static int setupearly_data_test(SSL_CTX **cctx, SSL_CTX **sctx, SSL **clientssl,
         return 0;
 
     if (idx == 2) {
-        /* Create the PSK */
-        const SSL_CIPHER *cipher = NULL;
-        const unsigned char key[] = {
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
-            0x2c, 0x2d, 0x2e, 0x2f
-        };
-
-        cipher = SSL_CIPHER_find(*clientssl, TLS13_AES_256_GCM_SHA384_BYTES);
-        clientpsk = SSL_SESSION_new();
+        clientpsk = create_a_psk(*clientssl);
         if (!TEST_ptr(clientpsk)
-                || !TEST_ptr(cipher)
-                || !TEST_true(SSL_SESSION_set1_master_key(clientpsk, key,
-                                                          sizeof(key)))
-                || !TEST_true(SSL_SESSION_set_cipher(clientpsk, cipher))
-                || !TEST_true(
-                        SSL_SESSION_set_protocol_version(clientpsk,
-                                                         TLS1_3_VERSION))
                    /*
                     * We just choose an arbitrary value for max_early_data which
                     * should be big enough for testing purposes.
@@ -2155,12 +3529,65 @@ static int test_early_data_read_write(int idx)
     return testresult;
 }
 
-static int test_early_data_replay(int idx)
+static int allow_ed_cb_called = 0;
+
+static int allow_early_data_cb(SSL *s, void *arg)
+{
+    int *usecb = (int *)arg;
+
+    allow_ed_cb_called++;
+
+    if (*usecb == 1)
+        return 0;
+
+    return 1;
+}
+
+/*
+ * idx == 0: Standard early_data setup
+ * idx == 1: early_data setup using read_ahead
+ * usecb == 0: Don't use a custom early data callback
+ * usecb == 1: Use a custom early data callback and reject the early data
+ * usecb == 2: Use a custom early data callback and accept the early data
+ * confopt == 0: Configure anti-replay directly
+ * confopt == 1: Configure anti-replay using SSL_CONF
+ */
+static int test_early_data_replay_int(int idx, int usecb, int confopt)
 {
     SSL_CTX *cctx = NULL, *sctx = NULL;
     SSL *clientssl = NULL, *serverssl = NULL;
     int testresult = 0;
     SSL_SESSION *sess = NULL;
+    size_t readbytes, written;
+    unsigned char buf[20];
+
+    allow_ed_cb_called = 0;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
+                                       &sctx, &cctx, cert, privkey)))
+        return 0;
+
+    if (usecb > 0) {
+        if (confopt == 0) {
+            SSL_CTX_set_options(sctx, SSL_OP_NO_ANTI_REPLAY);
+        } else {
+            SSL_CONF_CTX *confctx = SSL_CONF_CTX_new();
+
+            if (!TEST_ptr(confctx))
+                goto end;
+            SSL_CONF_CTX_set_flags(confctx, SSL_CONF_FLAG_FILE
+                                            | SSL_CONF_FLAG_SERVER);
+            SSL_CONF_CTX_set_ssl_ctx(confctx, sctx);
+            if (!TEST_int_eq(SSL_CONF_cmd(confctx, "Options", "-AntiReplay"),
+                             2)) {
+                SSL_CONF_CTX_free(confctx);
+                goto end;
+            }
+            SSL_CONF_CTX_free(confctx);
+        }
+        SSL_CTX_set_allow_early_data_cb(sctx, allow_early_data_cb, &usecb);
+    }
 
     if (!TEST_true(setupearly_data_test(&cctx, &sctx, &clientssl,
                                         &serverssl, &sess, idx)))
@@ -2182,14 +3609,49 @@ static int test_early_data_replay(int idx)
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
                                       &clientssl, NULL, NULL))
-            || !TEST_true(SSL_set_session(clientssl, sess))
-            || !TEST_true(create_ssl_connection(serverssl, clientssl,
-                          SSL_ERROR_NONE))
-               /*
-                * This time we should not have resumed the session because we
-                * already used it once.
-                */
-            || !TEST_false(SSL_session_reused(clientssl)))
+            || !TEST_true(SSL_set_session(clientssl, sess)))
+        goto end;
+
+    /* Write and read some early data */
+    if (!TEST_true(SSL_write_early_data(clientssl, MSG1, strlen(MSG1),
+                                        &written))
+            || !TEST_size_t_eq(written, strlen(MSG1)))
+        goto end;
+
+    if (usecb <= 1) {
+        if (!TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                                             &readbytes),
+                         SSL_READ_EARLY_DATA_FINISH)
+                   /*
+                    * The ticket was reused, so the we should have rejected the
+                    * early data
+                    */
+                || !TEST_int_eq(SSL_get_early_data_status(serverssl),
+                                SSL_EARLY_DATA_REJECTED))
+            goto end;
+    } else {
+        /* In this case the callback decides to accept the early data */
+        if (!TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                                             &readbytes),
+                         SSL_READ_EARLY_DATA_SUCCESS)
+                || !TEST_mem_eq(MSG1, strlen(MSG1), buf, readbytes)
+                   /*
+                    * Server will have sent its flight so client can now send
+                    * end of early data and complete its half of the handshake
+                    */
+                || !TEST_int_gt(SSL_connect(clientssl), 0)
+                || !TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                                             &readbytes),
+                                SSL_READ_EARLY_DATA_FINISH)
+                || !TEST_int_eq(SSL_get_early_data_status(serverssl),
+                                SSL_EARLY_DATA_ACCEPTED))
+            goto end;
+    }
+
+    /* Complete the connection */
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+            || !TEST_int_eq(SSL_session_reused(clientssl), (usecb > 0) ? 1 : 0)
+            || !TEST_int_eq(allow_ed_cb_called, usecb > 0 ? 1 : 0))
         goto end;
 
     testresult = 1;
@@ -2206,11 +3668,27 @@ static int test_early_data_replay(int idx)
     return testresult;
 }
 
+static int test_early_data_replay(int idx)
+{
+    int ret = 1, usecb, confopt;
+
+    for (usecb = 0; usecb < 3; usecb++) {
+        for (confopt = 0; confopt < 2; confopt++)
+            ret &= test_early_data_replay_int(idx, usecb, confopt);
+    }
+
+    return ret;
+}
+
 /*
  * Helper function to test that a server attempting to read early data can
  * handle a connection from a client where the early data should be skipped.
+ * testtype: 0 == No HRR
+ * testtype: 1 == HRR
+ * testtype: 2 == HRR, invalid early_data sent after HRR
+ * testtype: 3 == recv_max_early_data set to 0
  */
-static int early_data_skip_helper(int hrr, int idx)
+static int early_data_skip_helper(int testtype, int idx)
 {
     SSL_CTX *cctx = NULL, *sctx = NULL;
     SSL *clientssl = NULL, *serverssl = NULL;
@@ -2223,10 +3701,15 @@ static int early_data_skip_helper(int hrr, int idx)
                                         &serverssl, &sess, idx)))
         goto end;
 
-    if (hrr) {
+    if (testtype == 1 || testtype == 2) {
         /* Force an HRR to occur */
+#if defined(OPENSSL_NO_EC)
+        if (!TEST_true(SSL_set1_groups_list(serverssl, "ffdhe3072")))
+            goto end;
+#else
         if (!TEST_true(SSL_set1_groups_list(serverssl, "P-256")))
             goto end;
+#endif
     } else if (idx == 2) {
         /*
          * We force early_data rejection by ensuring the PSK identity is
@@ -2243,13 +3726,17 @@ static int early_data_skip_helper(int hrr, int idx)
             goto end;
     }
 
+    if (testtype == 3
+            && !TEST_true(SSL_set_recv_max_early_data(serverssl, 0)))
+        goto end;
+
     /* Write some early data */
     if (!TEST_true(SSL_write_early_data(clientssl, MSG1, strlen(MSG1),
                                         &written))
             || !TEST_size_t_eq(written, strlen(MSG1)))
         goto end;
 
-    /* Server should reject the early data and skip over it */
+    /* Server should reject the early data */
     if (!TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
                                          &readbytes),
                      SSL_READ_EARLY_DATA_FINISH)
@@ -2258,7 +3745,12 @@ static int early_data_skip_helper(int hrr, int idx)
                             SSL_EARLY_DATA_REJECTED))
         goto end;
 
-    if (hrr) {
+    switch (testtype) {
+    case 0:
+        /* Nothing to do */
+        break;
+
+    case 1:
         /*
          * Finish off the handshake. We perform the same writes and reads as
          * further down but we expect them to fail due to the incomplete
@@ -2268,9 +3760,58 @@ static int early_data_skip_helper(int hrr, int idx)
                 || !TEST_false(SSL_read_ex(serverssl, buf, sizeof(buf),
                                &readbytes)))
             goto end;
+        break;
+
+    case 2:
+        {
+            BIO *wbio = SSL_get_wbio(clientssl);
+            /* A record that will appear as bad early_data */
+            const unsigned char bad_early_data[] = {
+                0x17, 0x03, 0x03, 0x00, 0x01, 0x00
+            };
+
+            /*
+             * We force the client to attempt a write. This will fail because
+             * we're still in the handshake. It will cause the second
+             * ClientHello to be sent.
+             */
+            if (!TEST_false(SSL_write_ex(clientssl, MSG2, strlen(MSG2),
+                                         &written)))
+                goto end;
+
+            /*
+             * Inject some early_data after the second ClientHello. This should
+             * cause the server to fail
+             */
+            if (!TEST_true(BIO_write_ex(wbio, bad_early_data,
+                                        sizeof(bad_early_data), &written)))
+                goto end;
+        }
+        /* fallthrough */
+
+    case 3:
+        /*
+         * This client has sent more early_data than we are willing to skip
+         * (case 3) or sent invalid early_data (case 2) so the connection should
+         * abort.
+         */
+        if (!TEST_false(SSL_read_ex(serverssl, buf, sizeof(buf), &readbytes))
+                || !TEST_int_eq(SSL_get_error(serverssl, 0), SSL_ERROR_SSL))
+            goto end;
+
+        /* Connection has failed - nothing more to do */
+        testresult = 1;
+        goto end;
+
+    default:
+        TEST_error("Invalid test type");
+        goto end;
     }
 
-    /* Should be able to send normal data despite rejection of early data */
+    /*
+     * Should be able to send normal data despite rejection of early data. The
+     * early_data should be skipped.
+     */
     if (!TEST_true(SSL_write_ex(clientssl, MSG2, strlen(MSG2), &written))
             || !TEST_size_t_eq(written, strlen(MSG2))
             || !TEST_int_eq(SSL_get_early_data_status(clientssl),
@@ -2309,6 +3850,25 @@ static int test_early_data_skip(int idx)
 static int test_early_data_skip_hrr(int idx)
 {
     return early_data_skip_helper(1, idx);
+}
+
+/*
+ * Test that a server attempting to read early data can handle a connection
+ * from a client where an HRR occurs and correctly fails if early_data is sent
+ * after the HRR
+ */
+static int test_early_data_skip_hrr_fail(int idx)
+{
+    return early_data_skip_helper(2, idx);
+}
+
+/*
+ * Test that a server attempting to read early data will abort if it tries to
+ * skip over too much.
+ */
+static int test_early_data_skip_abort(int idx)
+{
+    return early_data_skip_helper(3, idx);
 }
 
 /*
@@ -2369,16 +3929,6 @@ static int test_early_data_not_sent(int idx)
     SSL_CTX_free(sctx);
     SSL_CTX_free(cctx);
     return testresult;
-}
-
-static int hostname_cb(SSL *s, int *al, void *arg)
-{
-    const char *hostname = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
-
-    if (hostname != NULL && strcmp(hostname, "goodhost") == 0)
-        return  SSL_TLSEXT_ERR_OK;
-
-    return SSL_TLSEXT_ERR_NOACK;
 }
 
 static const char *servalpn;
@@ -2473,16 +4023,16 @@ static int test_early_data_psk(int idx)
 
     case 3:
         /*
-         * Set inconsistent SNI (server detected). In this case the connection
-         * will succeed but reject early_data.
+         * Set inconsistent SNI (server side). In this case the connection
+         * will succeed and accept early_data. In TLSv1.3 on the server side SNI
+         * is associated with each handshake - not the session. Therefore it
+         * should not matter that we used a different server name last time.
          */
         SSL_SESSION_free(serverpsk);
         serverpsk = SSL_SESSION_dup(clientpsk);
         if (!TEST_ptr(serverpsk)
                 || !TEST_true(SSL_SESSION_set1_hostname(serverpsk, "badhost")))
             goto end;
-        edstatus = SSL_EARLY_DATA_REJECTED;
-        readearlyres = SSL_READ_EARLY_DATA_FINISH;
         /* Fall through */
     case 4:
         /* Set consistent SNI */
@@ -2573,6 +4123,113 @@ static int test_early_data_psk(int idx)
     SSL_SESSION_free(clientpsk);
     SSL_SESSION_free(serverpsk);
     clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+
+/*
+ * Test TLSv1.3 PSK can be used to send early_data with all 5 ciphersuites
+ * idx == 0: Test with TLS1_3_RFC_AES_128_GCM_SHA256
+ * idx == 1: Test with TLS1_3_RFC_AES_256_GCM_SHA384
+ * idx == 2: Test with TLS1_3_RFC_CHACHA20_POLY1305_SHA256,
+ * idx == 3: Test with TLS1_3_RFC_AES_128_CCM_SHA256
+ * idx == 4: Test with TLS1_3_RFC_AES_128_CCM_8_SHA256
+ */
+static int test_early_data_psk_with_all_ciphers(int idx)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    SSL_SESSION *sess = NULL;
+    unsigned char buf[20];
+    size_t readbytes, written;
+    const SSL_CIPHER *cipher;
+    const char *cipher_str[] = {
+        TLS1_3_RFC_AES_128_GCM_SHA256,
+        TLS1_3_RFC_AES_256_GCM_SHA384,
+# if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+        TLS1_3_RFC_CHACHA20_POLY1305_SHA256,
+# else
+        NULL,
+# endif
+        TLS1_3_RFC_AES_128_CCM_SHA256,
+        TLS1_3_RFC_AES_128_CCM_8_SHA256
+    };
+    const unsigned char *cipher_bytes[] = {
+        TLS13_AES_128_GCM_SHA256_BYTES,
+        TLS13_AES_256_GCM_SHA384_BYTES,
+# if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+        TLS13_CHACHA20_POLY1305_SHA256_BYTES,
+# else
+        NULL,
+# endif
+        TLS13_AES_128_CCM_SHA256_BYTES,
+        TLS13_AES_128_CCM_8_SHA256_BYTES
+    };
+
+    if (cipher_str[idx] == NULL)
+        return 1;
+    /* Skip ChaCha20Poly1305 as currently FIPS module does not support it */
+    if (idx == 2 && is_fips == 1)
+        return 1;
+
+    /* We always set this up with a final parameter of "2" for PSK */
+    if (!TEST_true(setupearly_data_test(&cctx, &sctx, &clientssl,
+                                        &serverssl, &sess, 2)))
+        goto end;
+
+    if (!TEST_true(SSL_set_ciphersuites(clientssl, cipher_str[idx]))
+            || !TEST_true(SSL_set_ciphersuites(serverssl, cipher_str[idx])))
+        goto end;
+
+    /*
+     * 'setupearly_data_test' creates only one instance of SSL_SESSION
+     * and assigns to both client and server with incremented reference
+     * and the same instance is updated in 'sess'.
+     * So updating ciphersuite in 'sess' which will get reflected in
+     * PSK handshake using psk use sess and find sess cb.
+     */
+    cipher = SSL_CIPHER_find(clientssl, cipher_bytes[idx]);
+    if (!TEST_ptr(cipher) || !TEST_true(SSL_SESSION_set_cipher(sess, cipher)))
+        goto end;
+
+    SSL_set_connect_state(clientssl);
+    if (!TEST_true(SSL_write_early_data(clientssl, MSG1, strlen(MSG1),
+                                        &written)))
+        goto end;
+
+    if (!TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                                         &readbytes),
+                                         SSL_READ_EARLY_DATA_SUCCESS)
+            || !TEST_mem_eq(buf, readbytes, MSG1, strlen(MSG1))
+            || !TEST_int_eq(SSL_get_early_data_status(serverssl),
+                                                      SSL_EARLY_DATA_ACCEPTED)
+            || !TEST_int_eq(SSL_connect(clientssl), 1)
+            || !TEST_int_eq(SSL_accept(serverssl), 1))
+        goto end;
+
+    /* Send some normal data from client to server */
+    if (!TEST_true(SSL_write_ex(clientssl, MSG2, strlen(MSG2), &written))
+            || !TEST_size_t_eq(written, strlen(MSG2)))
+        goto end;
+
+    if (!TEST_true(SSL_read_ex(serverssl, buf, sizeof(buf), &readbytes))
+            || !TEST_mem_eq(buf, readbytes, MSG2, strlen(MSG2)))
+        goto end;
+
+    testresult = 1;
+ end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    if (clientssl != NULL)
+        SSL_shutdown(clientssl);
+    if (serverssl != NULL)
+        SSL_shutdown(serverssl);
     SSL_free(serverssl);
     SSL_free(clientssl);
     SSL_CTX_free(sctx);
@@ -2733,8 +4390,8 @@ static int test_set_ciphersuite(int idx)
     SSL *clientssl = NULL, *serverssl = NULL;
     int testresult = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey))
             || !TEST_true(SSL_CTX_set_ciphersuites(sctx,
                            "TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_SHA256")))
@@ -2803,9 +4460,13 @@ static int test_ciphersuite_change(void)
     const SSL_CIPHER *aes_128_gcm_sha256 = NULL;
 
     /* Create a session based on SHA-256 */
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey))
+            || !TEST_true(SSL_CTX_set_ciphersuites(sctx,
+                                                   "TLS_AES_128_GCM_SHA256:"
+                                                   "TLS_AES_256_GCM_SHA384:"
+                                                   "TLS_AES_128_CCM_SHA256"))
             || !TEST_true(SSL_CTX_set_ciphersuites(cctx,
                                                    "TLS_AES_128_GCM_SHA256"))
             || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
@@ -2823,12 +4484,11 @@ static int test_ciphersuite_change(void)
     SSL_free(clientssl);
     serverssl = clientssl = NULL;
 
-# if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
     /* Check we can resume a session with a different SHA-256 ciphersuite */
     if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
-                                            "TLS_CHACHA20_POLY1305_SHA256"))
-            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
-                                             NULL, NULL))
+                                            "TLS_AES_128_CCM_SHA256"))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
+                                             &clientssl, NULL, NULL))
             || !TEST_true(SSL_set_session(clientssl, clntsess))
             || !TEST_true(create_ssl_connection(serverssl, clientssl,
                                                 SSL_ERROR_NONE))
@@ -2842,7 +4502,6 @@ static int test_ciphersuite_change(void)
     SSL_free(serverssl);
     SSL_free(clientssl);
     serverssl = clientssl = NULL;
-# endif
 
     /*
      * Check attempting to resume a SHA-256 session with no SHA-256 ciphersuites
@@ -2924,6 +4583,305 @@ static int test_ciphersuite_change(void)
 }
 
 /*
+ * Test TLSv1.3 Key exchange
+ * Test 0 = Test all ECDHE Key exchange with TLSv1.3 client and server
+ * Test 1 = Test NID_X9_62_prime256v1 with TLSv1.3 client and server
+ * Test 2 = Test NID_secp384r1 with TLSv1.3 client and server
+ * Test 3 = Test NID_secp521r1 with TLSv1.3 client and server
+ * Test 4 = Test NID_X25519 with TLSv1.3 client and server
+ * Test 5 = Test NID_X448 with TLSv1.3 client and server
+ * Test 6 = Test all FFDHE Key exchange with TLSv1.3 client and server
+ * Test 7 = Test NID_ffdhe2048 with TLSv1.3 client and server
+ * Test 8 = Test NID_ffdhe3072 with TLSv1.3 client and server
+ * Test 9 = Test NID_ffdhe4096 with TLSv1.3 client and server
+ * Test 10 = Test NID_ffdhe6144 with TLSv1.3 client and server
+ * Test 11 = Test NID_ffdhe8192 with TLSv1.3 client and server
+ * Test 12 = Test all ECDHE with TLSv1.2 client and server
+ * Test 13 = Test all FFDHE with TLSv1.2 client and server
+ */
+static int test_key_exchange(int idx)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    int testresult = 0;
+# ifndef OPENSSL_NO_EC
+    int ecdhe_kexch_groups[] = {NID_X9_62_prime256v1, NID_secp384r1,
+                                NID_secp521r1, NID_X25519, NID_X448};
+# endif
+# ifndef OPENSSL_NO_DH
+    int ffdhe_kexch_groups[] = {NID_ffdhe2048, NID_ffdhe3072, NID_ffdhe4096,
+                                NID_ffdhe6144, NID_ffdhe8192};
+# endif
+    int kexch_alg;
+    int *kexch_groups = &kexch_alg;
+    int kexch_groups_size = 1;
+    int max_version = TLS1_3_VERSION;
+
+    switch (idx) {
+# ifndef OPENSSL_NO_EC
+# ifndef OPENSSL_NO_TLS1_2
+        case 12:
+            max_version = TLS1_2_VERSION;
+# endif
+            /* Fall through */
+        case 0:
+            kexch_groups = ecdhe_kexch_groups;
+            kexch_groups_size = OSSL_NELEM(ecdhe_kexch_groups);
+            break;
+        case 1:
+            kexch_alg = NID_X9_62_prime256v1;
+            break;
+        case 2:
+            kexch_alg = NID_secp384r1;
+            break;
+        case 3:
+            kexch_alg = NID_secp521r1;
+            break;
+        case 4:
+            kexch_alg = NID_X25519;
+            break;
+        case 5:
+            kexch_alg = NID_X448;
+            break;
+# endif
+# ifndef OPENSSL_NO_DH
+# ifndef OPENSSL_NO_TLS1_2
+        case 13:
+            max_version = TLS1_2_VERSION;
+# endif
+            /* Fall through */
+        case 6:
+            kexch_groups = ffdhe_kexch_groups;
+            kexch_groups_size = OSSL_NELEM(ffdhe_kexch_groups);
+            break;
+        case 7:
+            kexch_alg = NID_ffdhe2048;
+            break;
+        case 8:
+            kexch_alg = NID_ffdhe3072;
+            break;
+        case 9:
+            kexch_alg = NID_ffdhe4096;
+            break;
+        case 10:
+            kexch_alg = NID_ffdhe6144;
+            break;
+        case 11:
+            kexch_alg = NID_ffdhe8192;
+            break;
+# endif
+        default:
+            /* We're skipping this test */
+            return 1;
+    }
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION,
+                                       max_version, &sctx, &cctx, cert,
+                                       privkey)))
+        goto end;
+
+    if (!TEST_true(SSL_CTX_set_ciphersuites(sctx,
+                   TLS1_3_RFC_AES_128_GCM_SHA256)))
+        goto end;
+
+    if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                   TLS1_3_RFC_AES_128_GCM_SHA256)))
+        goto end;
+
+    if (!TEST_true(SSL_CTX_set_cipher_list(sctx,
+                   TLS1_TXT_RSA_WITH_AES_128_SHA)))
+        goto end;
+
+    /*
+     * Must include an EC ciphersuite so that we send supported groups in
+     * TLSv1.2
+     */
+# ifndef OPENSSL_NO_TLS1_2
+    if (!TEST_true(SSL_CTX_set_cipher_list(cctx,
+                   TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_CCM ":"
+                   TLS1_TXT_RSA_WITH_AES_128_SHA)))
+        goto end;
+# endif
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(SSL_set1_groups(serverssl, kexch_groups, kexch_groups_size))
+        || !TEST_true(SSL_set1_groups(clientssl, kexch_groups, kexch_groups_size)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    /*
+     * If Handshake succeeds the negotiated kexch alg should be the first one in
+     * configured, except in the case of FFDHE groups (idx 13), which are
+     * TLSv1.3 only so we expect no shared group to exist.
+     */
+    if (!TEST_int_eq(SSL_get_shared_group(serverssl, 0),
+                     idx == 13 ? 0 : kexch_groups[0]))
+        goto end;
+    if (max_version == TLS1_3_VERSION) {
+        if (!TEST_int_eq(SSL_get_negotiated_group(serverssl), kexch_groups[0]))
+            goto end;
+        if (!TEST_int_eq(SSL_get_negotiated_group(clientssl), kexch_groups[0]))
+            goto end;
+    }
+
+    testresult = 1;
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+
+/*
+ * Test TLSv1.3 Cipher Suite
+ * Test 0 = Set TLS1.3 cipher on context
+ * Test 1 = Set TLS1.3 cipher on SSL
+ * Test 2 = Set TLS1.3 and TLS1.2 cipher on context
+ * Test 3 = Set TLS1.3 and TLS1.2 cipher on SSL
+ */
+static int test_tls13_ciphersuite(int idx)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    static const struct {
+        const char *ciphername;
+        int fipscapable;
+    } t13_ciphers[] = {
+        { TLS1_3_RFC_AES_128_GCM_SHA256, 1 },
+        { TLS1_3_RFC_AES_256_GCM_SHA384, 1 },
+        { TLS1_3_RFC_AES_128_CCM_SHA256, 1 },
+# if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+        { TLS1_3_RFC_CHACHA20_POLY1305_SHA256, 0 },
+        { TLS1_3_RFC_AES_256_GCM_SHA384
+          ":" TLS1_3_RFC_CHACHA20_POLY1305_SHA256, 0 },
+# endif
+        { TLS1_3_RFC_AES_128_CCM_8_SHA256 ":" TLS1_3_RFC_AES_128_CCM_SHA256, 1 }
+    };
+    const char *t13_cipher = NULL;
+    const char *t12_cipher = NULL;
+    const char *negotiated_scipher;
+    const char *negotiated_ccipher;
+    int set_at_ctx = 0;
+    int set_at_ssl = 0;
+    int testresult = 0;
+    int max_ver;
+    size_t i;
+
+    switch (idx) {
+        case 0:
+            set_at_ctx = 1;
+            break;
+        case 1:
+            set_at_ssl = 1;
+            break;
+        case 2:
+            set_at_ctx = 1;
+            t12_cipher = TLS1_TXT_RSA_WITH_AES_128_SHA256;
+            break;
+        case 3:
+            set_at_ssl = 1;
+            t12_cipher = TLS1_TXT_RSA_WITH_AES_128_SHA256;
+            break;
+    }
+
+    for (max_ver = TLS1_2_VERSION; max_ver <= TLS1_3_VERSION; max_ver++) {
+# ifdef OPENSSL_NO_TLS1_2
+        if (max_ver == TLS1_2_VERSION)
+            continue;
+# endif
+        for (i = 0; i < OSSL_NELEM(t13_ciphers); i++) {
+            if (is_fips && !t13_ciphers[i].fipscapable)
+                continue;
+            t13_cipher = t13_ciphers[i].ciphername;
+            if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                               TLS_client_method(),
+                                               TLS1_VERSION, max_ver,
+                                               &sctx, &cctx, cert, privkey)))
+                goto end;
+
+            if (set_at_ctx) {
+                if (!TEST_true(SSL_CTX_set_ciphersuites(sctx, t13_cipher))
+                    || !TEST_true(SSL_CTX_set_ciphersuites(cctx, t13_cipher)))
+                    goto end;
+                if (t12_cipher != NULL) {
+                    if (!TEST_true(SSL_CTX_set_cipher_list(sctx, t12_cipher))
+                        || !TEST_true(SSL_CTX_set_cipher_list(cctx,
+                                                              t12_cipher)))
+                        goto end;
+                }
+            }
+
+            if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl,
+                                              &clientssl, NULL, NULL)))
+                goto end;
+
+            if (set_at_ssl) {
+                if (!TEST_true(SSL_set_ciphersuites(serverssl, t13_cipher))
+                    || !TEST_true(SSL_set_ciphersuites(clientssl, t13_cipher)))
+                    goto end;
+                if (t12_cipher != NULL) {
+                    if (!TEST_true(SSL_set_cipher_list(serverssl, t12_cipher))
+                        || !TEST_true(SSL_set_cipher_list(clientssl,
+                                                          t12_cipher)))
+                        goto end;
+                }
+            }
+
+            if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                 SSL_ERROR_NONE)))
+                goto end;
+
+            negotiated_scipher = SSL_CIPHER_get_name(SSL_get_current_cipher(
+                                                                 serverssl));
+            negotiated_ccipher = SSL_CIPHER_get_name(SSL_get_current_cipher(
+                                                                 clientssl));
+            if (!TEST_str_eq(negotiated_scipher, negotiated_ccipher))
+                goto end;
+
+            /*
+             * TEST_strn_eq is used below because t13_cipher can contain
+             * multiple ciphersuites
+             */
+            if (max_ver == TLS1_3_VERSION
+                && !TEST_strn_eq(t13_cipher, negotiated_scipher,
+                                 strlen(negotiated_scipher)))
+                goto end;
+
+# ifndef OPENSSL_NO_TLS1_2
+            /* Below validation is not done when t12_cipher is NULL */
+            if (max_ver == TLS1_2_VERSION && t12_cipher != NULL
+                && !TEST_str_eq(t12_cipher, negotiated_scipher))
+                goto end;
+# endif
+
+            SSL_free(serverssl);
+            serverssl = NULL;
+            SSL_free(clientssl);
+            clientssl = NULL;
+            SSL_CTX_free(sctx);
+            sctx = NULL;
+            SSL_CTX_free(cctx);
+            cctx = NULL;
+        }
+    }
+
+    testresult = 1;
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+
+/*
  * Test TLSv1.3 PSKs
  * Test 0 = Test new style callbacks
  * Test 1 = Test both new and old style callbacks
@@ -2943,8 +4901,8 @@ static int test_tls13_psk(int idx)
     };
     int testresult = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, idx == 3 ? NULL : cert,
                                        idx == 3 ? NULL : privkey)))
         goto end;
@@ -2957,6 +4915,16 @@ static int test_tls13_psk(int idx)
          * prefer SHA256 automatically.
          */
         if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                                                "TLS_AES_128_GCM_SHA256")))
+            goto end;
+    } else {
+        /*
+         * As noted above the server should prefer SHA256 automatically. However
+         * we are careful not to offer TLS_CHACHA20_POLY1305_SHA256 so this same
+         * code works even if we are testing with only the FIPS provider loaded.
+         */
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                                                "TLS_AES_256_GCM_SHA384:"
                                                 "TLS_AES_128_GCM_SHA256")))
             goto end;
     }
@@ -3066,8 +5034,13 @@ static int test_tls13_psk(int idx)
         goto end;
 
     /* Force an HRR */
+#if defined(OPENSSL_NO_EC)
+    if (!TEST_true(SSL_set1_groups_list(serverssl, "ffdhe3072")))
+        goto end;
+#else
     if (!TEST_true(SSL_set1_groups_list(serverssl, "P-256")))
         goto end;
+#endif
 
     /*
      * Check we can create a connection, the PSK is used and the callbacks are
@@ -3191,8 +5164,8 @@ static int test_stateless(void)
     SSL *serverssl = NULL, *clientssl = NULL;
     int testresult = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
 
@@ -3415,14 +5388,14 @@ static int test_custom_exts(int tst)
     clntaddnewcb = clntparsenewcb = srvaddnewcb = srvparsenewcb = 0;
     snicb = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
 
     if (tst == 2
-            && !TEST_true(create_ssl_ctx_pair(TLS_server_method(), NULL,
-                                              TLS1_VERSION, TLS_MAX_VERSION,
+            && !TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(), NULL,
+                                              TLS1_VERSION, 0,
                                               &sctx2, NULL, cert, privkey)))
         goto end;
 
@@ -3613,7 +5586,7 @@ static int test_serverinfo(int tst)
     int ret, expected, testresult = 0;
     SSL_CTX *ctx;
 
-    ctx = SSL_CTX_new(TLS_method());
+    ctx = SSL_CTX_new_with_libctx(libctx, NULL, TLS_method());
     if (!TEST_ptr(ctx))
         goto end;
 
@@ -3663,20 +5636,25 @@ static int test_serverinfo(int tst)
  * no test vectors so all we do is test that both sides of the communication
  * produce the same results for different protocol versions.
  */
+#define SMALL_LABEL_LEN 10
+#define LONG_LABEL_LEN  249
 static int test_export_key_mat(int tst)
 {
     int testresult = 0;
     SSL_CTX *cctx = NULL, *sctx = NULL, *sctx2 = NULL;
     SSL *clientssl = NULL, *serverssl = NULL;
-    const char label[] = "test label";
+    const char label[LONG_LABEL_LEN + 1] = "test label";
     const unsigned char context[] = "context";
     const unsigned char *emptycontext = NULL;
     unsigned char ckeymat1[80], ckeymat2[80], ckeymat3[80];
     unsigned char skeymat1[80], skeymat2[80], skeymat3[80];
+    size_t labellen;
     const int protocols[] = {
         TLS1_VERSION,
         TLS1_1_VERSION,
         TLS1_2_VERSION,
+        TLS1_3_VERSION,
+        TLS1_3_VERSION,
         TLS1_3_VERSION
     };
 
@@ -3688,56 +5666,92 @@ static int test_export_key_mat(int tst)
     if (tst == 1)
         return 1;
 #endif
+    if (is_fips && (tst == 0 || tst == 1))
+        return 1;
 #ifdef OPENSSL_NO_TLS1_2
     if (tst == 2)
         return 1;
 #endif
 #ifdef OPENSSL_NO_TLS1_3
-    if (tst == 3)
+    if (tst >= 3)
         return 1;
 #endif
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
 
     OPENSSL_assert(tst >= 0 && (size_t)tst < OSSL_NELEM(protocols));
     SSL_CTX_set_max_proto_version(cctx, protocols[tst]);
     SSL_CTX_set_min_proto_version(cctx, protocols[tst]);
+    if ((protocols[tst] < TLS1_2_VERSION) &&
+        (!SSL_CTX_set_cipher_list(cctx, "DEFAULT:@SECLEVEL=0")
+        || !SSL_CTX_set_cipher_list(sctx, "DEFAULT:@SECLEVEL=0")))
+        goto end;
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl, NULL,
-                                      NULL))
-            || !TEST_true(create_ssl_connection(serverssl, clientssl,
-                                                SSL_ERROR_NONE)))
+                                      NULL)))
         goto end;
+
+    /*
+     * Premature call of SSL_export_keying_material should just fail.
+     */
+    if (!TEST_int_le(SSL_export_keying_material(clientssl, ckeymat1,
+                                                sizeof(ckeymat1), label,
+                                                SMALL_LABEL_LEN + 1, context,
+                                                sizeof(context) - 1, 1), 0))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                         SSL_ERROR_NONE)))
+        goto end;
+
+    if (tst == 5) {
+        /*
+         * TLSv1.3 imposes a maximum label len of 249 bytes. Check we fail if we
+         * go over that.
+         */
+        if (!TEST_int_le(SSL_export_keying_material(clientssl, ckeymat1,
+                                                    sizeof(ckeymat1), label,
+                                                    LONG_LABEL_LEN + 1, context,
+                                                    sizeof(context) - 1, 1), 0))
+            goto end;
+
+        testresult = 1;
+        goto end;
+    } else if (tst == 4) {
+        labellen = LONG_LABEL_LEN;
+    } else {
+        labellen = SMALL_LABEL_LEN;
+    }
 
     if (!TEST_int_eq(SSL_export_keying_material(clientssl, ckeymat1,
                                                 sizeof(ckeymat1), label,
-                                                sizeof(label) - 1, context,
+                                                labellen, context,
                                                 sizeof(context) - 1, 1), 1)
             || !TEST_int_eq(SSL_export_keying_material(clientssl, ckeymat2,
                                                        sizeof(ckeymat2), label,
-                                                       sizeof(label) - 1,
+                                                       labellen,
                                                        emptycontext,
                                                        0, 1), 1)
             || !TEST_int_eq(SSL_export_keying_material(clientssl, ckeymat3,
                                                        sizeof(ckeymat3), label,
-                                                       sizeof(label) - 1,
+                                                       labellen,
                                                        NULL, 0, 0), 1)
             || !TEST_int_eq(SSL_export_keying_material(serverssl, skeymat1,
                                                        sizeof(skeymat1), label,
-                                                       sizeof(label) - 1,
+                                                       labellen,
                                                        context,
                                                        sizeof(context) -1, 1),
                             1)
             || !TEST_int_eq(SSL_export_keying_material(serverssl, skeymat2,
                                                        sizeof(skeymat2), label,
-                                                       sizeof(label) - 1,
+                                                       labellen,
                                                        emptycontext,
                                                        0, 1), 1)
             || !TEST_int_eq(SSL_export_keying_material(serverssl, skeymat3,
                                                        sizeof(skeymat3), label,
-                                                       sizeof(label) - 1,
+                                                       labellen,
                                                        NULL, 0, 0), 1)
                /*
                 * Check that both sides created the same key material with the
@@ -3766,10 +5780,10 @@ static int test_export_key_mat(int tst)
      * Check that an empty context and no context produce different results in
      * protocols less than TLSv1.3. In TLSv1.3 they should be the same.
      */
-    if ((tst != 3 && !TEST_mem_ne(ckeymat2, sizeof(ckeymat2), ckeymat3,
+    if ((tst < 3 && !TEST_mem_ne(ckeymat2, sizeof(ckeymat2), ckeymat3,
                                   sizeof(ckeymat3)))
-            || (tst ==3 && !TEST_mem_eq(ckeymat2, sizeof(ckeymat2), ckeymat3,
-                                        sizeof(ckeymat3))))
+            || (tst >= 3 && !TEST_mem_eq(ckeymat2, sizeof(ckeymat2), ckeymat3,
+                                         sizeof(ckeymat3))))
         goto end;
 
     testresult = 1;
@@ -3861,6 +5875,148 @@ static int test_export_key_mat_early(int idx)
 
     return testresult;
 }
+
+#define NUM_KEY_UPDATE_MESSAGES 40
+/*
+ * Test KeyUpdate.
+ */
+static int test_key_update(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0, i, j;
+    char buf[20];
+    static char *mess = "A test message";
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_3_VERSION,
+                                       0,
+                                       &sctx, &cctx, cert, privkey))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE)))
+        goto end;
+
+    for (j = 0; j < 2; j++) {
+        /* Send lots of KeyUpdate messages */
+        for (i = 0; i < NUM_KEY_UPDATE_MESSAGES; i++) {
+            if (!TEST_true(SSL_key_update(clientssl,
+                                          (j == 0)
+                                          ? SSL_KEY_UPDATE_NOT_REQUESTED
+                                          : SSL_KEY_UPDATE_REQUESTED))
+                    || !TEST_true(SSL_do_handshake(clientssl)))
+                goto end;
+        }
+
+        /* Check that sending and receiving app data is ok */
+        if (!TEST_int_eq(SSL_write(clientssl, mess, strlen(mess)), strlen(mess))
+                || !TEST_int_eq(SSL_read(serverssl, buf, sizeof(buf)),
+                                         strlen(mess)))
+            goto end;
+
+        if (!TEST_int_eq(SSL_write(serverssl, mess, strlen(mess)), strlen(mess))
+                || !TEST_int_eq(SSL_read(clientssl, buf, sizeof(buf)),
+                                         strlen(mess)))
+            goto end;
+    }
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+/*
+ * Test we can handle a KeyUpdate (update requested) message while write data
+ * is pending.
+ * Test 0: Client sends KeyUpdate while Server is writing
+ * Test 1: Server sends KeyUpdate while Client is writing
+ */
+static int test_key_update_in_write(int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    char buf[20];
+    static char *mess = "A test message";
+    BIO *bretry = BIO_new(bio_s_always_retry());
+    BIO *tmp = NULL;
+    SSL *peerupdate = NULL, *peerwrite = NULL;
+
+    if (!TEST_ptr(bretry)
+            || !TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                              TLS_client_method(),
+                                              TLS1_3_VERSION,
+                                              0,
+                                              &sctx, &cctx, cert, privkey))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE)))
+        goto end;
+
+    peerupdate = tst == 0 ? clientssl : serverssl;
+    peerwrite = tst == 0 ? serverssl : clientssl;
+
+    if (!TEST_true(SSL_key_update(peerupdate, SSL_KEY_UPDATE_REQUESTED))
+            || !TEST_true(SSL_do_handshake(peerupdate)))
+        goto end;
+
+    /* Swap the writing endpoint's write BIO to force a retry */
+    tmp = SSL_get_wbio(peerwrite);
+    if (!TEST_ptr(tmp) || !TEST_true(BIO_up_ref(tmp))) {
+        tmp = NULL;
+        goto end;
+    }
+    SSL_set0_wbio(peerwrite, bretry);
+    bretry = NULL;
+
+    /* Write data that we know will fail with SSL_ERROR_WANT_WRITE */
+    if (!TEST_int_eq(SSL_write(peerwrite, mess, strlen(mess)), -1)
+            || !TEST_int_eq(SSL_get_error(peerwrite, 0), SSL_ERROR_WANT_WRITE))
+        goto end;
+
+    /* Reinstate the original writing endpoint's write BIO */
+    SSL_set0_wbio(peerwrite, tmp);
+    tmp = NULL;
+
+    /* Now read some data - we will read the key update */
+    if (!TEST_int_eq(SSL_read(peerwrite, buf, sizeof(buf)), -1)
+            || !TEST_int_eq(SSL_get_error(peerwrite, 0), SSL_ERROR_WANT_READ))
+        goto end;
+
+    /*
+     * Complete the write we started previously and read it from the other
+     * endpoint
+     */
+    if (!TEST_int_eq(SSL_write(peerwrite, mess, strlen(mess)), strlen(mess))
+            || !TEST_int_eq(SSL_read(peerupdate, buf, sizeof(buf)), strlen(mess)))
+        goto end;
+
+    /* Write more data to ensure we send the KeyUpdate message back */
+    if (!TEST_int_eq(SSL_write(peerwrite, mess, strlen(mess)), strlen(mess))
+            || !TEST_int_eq(SSL_read(peerupdate, buf, sizeof(buf)), strlen(mess)))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    BIO_free(bretry);
+    BIO_free(tmp);
+
+    return testresult;
+}
 #endif /* OPENSSL_NO_TLS1_3 */
 
 static int test_ssl_clear(int idx)
@@ -3875,8 +6031,8 @@ static int test_ssl_clear(int idx)
 #endif
 
     /* Create an initial connection */
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey))
             || (idx == 1
                 && !TEST_true(SSL_CTX_set_max_proto_version(cctx,
@@ -3922,11 +6078,15 @@ static int get_MFL_from_client_hello(BIO *bio, int *mfl_codemfl_code)
 {
     long len;
     unsigned char *data;
-    PACKET pkt = {0}, pkt2 = {0}, pkt3 = {0};
+    PACKET pkt, pkt2, pkt3;
     unsigned int MFL_code = 0, type = 0;
 
     if (!TEST_uint_gt( len = BIO_get_mem_data( bio, (char **) &data ), 0 ) )
         goto end;
+
+    memset(&pkt, 0, sizeof(pkt));
+    memset(&pkt2, 0, sizeof(pkt2));
+    memset(&pkt3, 0, sizeof(pkt3));
 
     if (!TEST_true( PACKET_buf_init( &pkt, data, len ) )
                /* Skip the record header */
@@ -3981,7 +6141,7 @@ static int test_max_fragment_len_ext(int idx_tst)
     int testresult = 0, MFL_mode = 0;
     BIO *rbio, *wbio;
 
-    ctx = SSL_CTX_new(TLS_method());
+    ctx = SSL_CTX_new_with_libctx(libctx, NULL, TLS_method());
     if (!TEST_ptr(ctx))
         goto end;
 
@@ -4031,8 +6191,8 @@ static int test_pha_key_update(void)
     SSL *clientssl = NULL, *serverssl = NULL;
     int testresult = 0;
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         return 0;
 
@@ -4042,12 +6202,11 @@ static int test_pha_key_update(void)
         || !TEST_true(SSL_CTX_set_max_proto_version(cctx, TLS1_3_VERSION)))
         goto end;
 
+    SSL_CTX_set_post_handshake_auth(cctx, 1);
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
                                       NULL, NULL)))
         goto end;
-
-    SSL_force_post_handshake_auth(clientssl);
 
     if (!TEST_true(create_ssl_connection(serverssl, clientssl,
                                          SSL_ERROR_NONE)))
@@ -4086,6 +6245,8 @@ static int test_pha_key_update(void)
 #if !defined(OPENSSL_NO_SRP) && !defined(OPENSSL_NO_TLS1_2)
 
 static SRP_VBASE *vbase = NULL;
+
+DEFINE_STACK_OF(SRP_user_pwd)
 
 static int ssl_srp_cb(SSL *s, int *ad, void *arg)
 {
@@ -4130,8 +6291,8 @@ static int create_new_vfile(char *userid, char *password, const char *filename)
     if (!TEST_ptr(dummy) || !TEST_ptr(row))
         goto end;
 
-    gNid = SRP_create_verifier(userid, password, &row[DB_srpsalt],
-                               &row[DB_srpverifier], NULL, NULL);
+    gNid = SRP_create_verifier_ex(userid, password, &row[DB_srpsalt],
+                                  &row[DB_srpverifier], NULL, NULL, libctx, NULL);
     if (!TEST_ptr(gNid))
         goto end;
 
@@ -4187,8 +6348,8 @@ static int create_new_vbase(char *userid, char *password)
     if (!TEST_ptr(lgN))
         goto end;
 
-    if (!TEST_true(SRP_create_verifier_BN(userid, password, &salt, &verifier,
-                                          lgN->N, lgN->g)))
+    if (!TEST_true(SRP_create_verifier_BN_ex(userid, password, &salt, &verifier,
+                                             lgN->N, lgN->g, libctx, NULL)))
         goto end;
 
     user_pwd = OPENSSL_zalloc(sizeof(*user_pwd));
@@ -4255,8 +6416,8 @@ static int test_srp(int tst)
             goto end;
     }
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
-                                       TLS1_VERSION, TLS_MAX_VERSION,
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), TLS1_VERSION, 0,
                                        &sctx, &cctx, cert, privkey)))
         goto end;
 
@@ -4346,18 +6507,14 @@ static struct info_cb_states_st {
         {SSL_CB_LOOP, "TWCCS"}, {SSL_CB_LOOP, "TWEE"}, {SSL_CB_LOOP, "TWSC"},
         {SSL_CB_LOOP, "TRSCV"}, {SSL_CB_LOOP, "TWFIN"}, {SSL_CB_LOOP, "TED"},
         {SSL_CB_EXIT, NULL}, {SSL_CB_LOOP, "TED"}, {SSL_CB_LOOP, "TRFIN"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "TWST"}, {SSL_CB_HANDSHAKE_DONE, NULL},
-        {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "TWST"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_EXIT, NULL},
-        {SSL_CB_ALERT, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "PINIT "}, {SSL_CB_LOOP, "PINIT "}, {SSL_CB_LOOP, "TRCH"},
-        {SSL_CB_LOOP, "TWSH"}, {SSL_CB_LOOP, "TWCCS"}, {SSL_CB_LOOP, "TWEE"},
-        {SSL_CB_LOOP, "TWFIN"}, {SSL_CB_LOOP, "TED"}, {SSL_CB_EXIT, NULL},
-        {SSL_CB_LOOP, "TED"}, {SSL_CB_LOOP, "TRFIN"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "TWST"}, {SSL_CB_HANDSHAKE_DONE, NULL},
-        {SSL_CB_EXIT, NULL}, {0, NULL},
+        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_LOOP, "TWST"},
+        {SSL_CB_LOOP, "TWST"}, {SSL_CB_EXIT, NULL}, {SSL_CB_ALERT, NULL},
+        {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "PINIT "},
+        {SSL_CB_LOOP, "PINIT "}, {SSL_CB_LOOP, "TRCH"}, {SSL_CB_LOOP, "TWSH"},
+        {SSL_CB_LOOP, "TWCCS"}, {SSL_CB_LOOP, "TWEE"}, {SSL_CB_LOOP, "TWFIN"},
+        {SSL_CB_LOOP, "TED"}, {SSL_CB_EXIT, NULL}, {SSL_CB_LOOP, "TED"},
+        {SSL_CB_LOOP, "TRFIN"}, {SSL_CB_HANDSHAKE_DONE, NULL},
+        {SSL_CB_LOOP, "TWST"}, {SSL_CB_EXIT, NULL}, {0, NULL},
     }, {
         /* TLSv1.3 client followed by resumption */
         {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "PINIT "},
@@ -4365,20 +6522,16 @@ static struct info_cb_states_st {
         {SSL_CB_LOOP, "TRSH"}, {SSL_CB_LOOP, "TREE"}, {SSL_CB_LOOP, "TRSC"},
         {SSL_CB_LOOP, "TRSCV"}, {SSL_CB_LOOP, "TRFIN"}, {SSL_CB_LOOP, "TWCCS"},
         {SSL_CB_LOOP, "TWFIN"},  {SSL_CB_HANDSHAKE_DONE, NULL},
-        {SSL_CB_EXIT, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"},
-        {SSL_CB_HANDSHAKE_DONE, NULL},  {SSL_CB_EXIT, NULL},
-        {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "SSLOK "},
-        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"},
-        {SSL_CB_HANDSHAKE_DONE, NULL},  {SSL_CB_EXIT, NULL},
+        {SSL_CB_EXIT, NULL}, {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "SSLOK "},
+        {SSL_CB_LOOP, "TRST"}, {SSL_CB_EXIT, NULL}, {SSL_CB_LOOP, "SSLOK "},
+        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"}, {SSL_CB_EXIT, NULL},
         {SSL_CB_ALERT, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
         {SSL_CB_LOOP, "PINIT "}, {SSL_CB_LOOP, "TWCH"}, {SSL_CB_EXIT, NULL},
         {SSL_CB_LOOP, "TWCH"}, {SSL_CB_LOOP, "TRSH"},  {SSL_CB_LOOP, "TREE"},
         {SSL_CB_LOOP, "TRFIN"}, {SSL_CB_LOOP, "TWCCS"}, {SSL_CB_LOOP, "TWFIN"},
         {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_EXIT, NULL},
-        {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "SSLOK "},
-        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_EXIT, NULL}, {0, NULL},
+        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"},
+        {SSL_CB_EXIT, NULL}, {0, NULL},
     }, {
         /* TLSv1.3 server, early_data */
         {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "PINIT "},
@@ -4387,8 +6540,7 @@ static struct info_cb_states_st {
         {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_EXIT, NULL},
         {SSL_CB_HANDSHAKE_START, NULL}, {SSL_CB_LOOP, "TED"},
         {SSL_CB_LOOP, "TED"}, {SSL_CB_LOOP, "TWEOED"}, {SSL_CB_LOOP, "TRFIN"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "TWST"}, {SSL_CB_HANDSHAKE_DONE, NULL},
+        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_LOOP, "TWST"},
         {SSL_CB_EXIT, NULL}, {0, NULL},
     }, {
         /* TLSv1.3 client, early_data */
@@ -4399,9 +6551,8 @@ static struct info_cb_states_st {
         {SSL_CB_LOOP, "TED"}, {SSL_CB_LOOP, "TRSH"}, {SSL_CB_LOOP, "TREE"},
         {SSL_CB_LOOP, "TRFIN"}, {SSL_CB_LOOP, "TPEDE"}, {SSL_CB_LOOP, "TWEOED"},
         {SSL_CB_LOOP, "TWFIN"}, {SSL_CB_HANDSHAKE_DONE, NULL},
-        {SSL_CB_EXIT, NULL}, {SSL_CB_HANDSHAKE_START, NULL},
-        {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "TRST"},
-        {SSL_CB_HANDSHAKE_DONE, NULL}, {SSL_CB_EXIT, NULL}, {0, NULL},
+        {SSL_CB_EXIT, NULL}, {SSL_CB_LOOP, "SSLOK "}, {SSL_CB_LOOP, "SSLOK "},
+        {SSL_CB_LOOP, "TRST"}, {SSL_CB_EXIT, NULL}, {0, NULL},
     }, {
         {0, NULL},
     }
@@ -4440,8 +6591,11 @@ static void sslapi_info_callback(const SSL *s, int where, int ret)
         return;
     }
 
-    /* Check that, if we've got SSL_CB_HANDSHAKE_DONE we are not in init */
-    if ((where & SSL_CB_HANDSHAKE_DONE) && SSL_in_init((SSL *)s) != 0) {
+    /*
+     * Check that, if we've got SSL_CB_HANDSHAKE_DONE we are not in init
+     */
+    if ((where & SSL_CB_HANDSHAKE_DONE)
+            && SSL_in_init((SSL *)s) != 0) {
         info_cb_failed = 1;
         return;
     }
@@ -4523,7 +6677,7 @@ static int test_info_callback(int tst)
     }
 #endif
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
                                        TLS_client_method(),
                                        tlsvers, tlsvers, &sctx, &cctx, cert,
                                        privkey)))
@@ -4583,16 +6737,16 @@ static int test_ssl_pending(int tst)
     size_t written, readbytes;
 
     if (tst == 0) {
-        if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+        if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
                                            TLS_client_method(),
-                                           TLS1_VERSION, TLS_MAX_VERSION,
+                                           TLS1_VERSION, 0,
                                            &sctx, &cctx, cert, privkey)))
             goto end;
     } else {
 #ifndef OPENSSL_NO_DTLS
-        if (!TEST_true(create_ssl_ctx_pair(DTLS_server_method(),
+        if (!TEST_true(create_ssl_ctx_pair(libctx, DTLS_server_method(),
                                            DTLS_client_method(),
-                                           DTLS1_VERSION, DTLS_MAX_VERSION,
+                                           DTLS1_VERSION, 0,
                                            &sctx, &cctx, cert, privkey)))
             goto end;
 #else
@@ -4636,6 +6790,7 @@ static struct {
     const char *srvrciphers;
     const char *srvrtls13ciphers;
     const char *shared;
+    const char *fipsshared;
 } shared_ciphers_data[] = {
 /*
  * We can't establish a connection (even in TLSv1.1) with these ciphersuites if
@@ -4648,14 +6803,29 @@ static struct {
         NULL,
         "AES256-SHA:DHE-RSA-AES128-SHA",
         NULL,
+        "AES256-SHA",
         "AES256-SHA"
     },
+# if !defined(OPENSSL_NO_CHACHA) \
+     && !defined(OPENSSL_NO_POLY1305) \
+     && !defined(OPENSSL_NO_EC)
+    {
+        TLS1_2_VERSION,
+        "AES128-SHA:ECDHE-RSA-CHACHA20-POLY1305",
+        NULL,
+        "AES128-SHA:ECDHE-RSA-CHACHA20-POLY1305",
+        NULL,
+        "AES128-SHA:ECDHE-RSA-CHACHA20-POLY1305",
+        "AES128-SHA"
+    },
+# endif
     {
         TLS1_2_VERSION,
         "AES128-SHA:DHE-RSA-AES128-SHA:AES256-SHA",
         NULL,
         "AES128-SHA:DHE-RSA-AES256-SHA:AES256-SHA",
         NULL,
+        "AES128-SHA:AES256-SHA",
         "AES128-SHA:AES256-SHA"
     },
     {
@@ -4664,6 +6834,7 @@ static struct {
         NULL,
         "AES128-SHA:DHE-RSA-AES128-SHA",
         NULL,
+        "AES128-SHA",
         "AES128-SHA"
     },
 #endif
@@ -4680,7 +6851,8 @@ static struct {
         "AES256-SHA:AES128-SHA256",
         NULL,
         "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:"
-        "TLS_AES_128_GCM_SHA256:AES256-SHA"
+        "TLS_AES_128_GCM_SHA256:AES256-SHA",
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:AES256-SHA"
     },
 #endif
 #ifndef OPENSSL_NO_TLS1_3
@@ -4690,19 +6862,41 @@ static struct {
         "TLS_AES_256_GCM_SHA384",
         "AES256-SHA",
         "TLS_AES_256_GCM_SHA384",
+        "TLS_AES_256_GCM_SHA384",
         "TLS_AES_256_GCM_SHA384"
     },
 #endif
 };
 
-static int test_ssl_get_shared_ciphers(int tst)
+static int int_test_ssl_get_shared_ciphers(int tst, int clnt)
 {
     SSL_CTX *cctx = NULL, *sctx = NULL;
     SSL *clientssl = NULL, *serverssl = NULL;
     int testresult = 0;
     char buf[1024];
+    OPENSSL_CTX *tmplibctx = OPENSSL_CTX_new();
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+    if (!TEST_ptr(tmplibctx))
+        goto end;
+
+    /*
+     * Regardless of whether we're testing with the FIPS provider loaded into
+     * libctx, we want one peer to always use the full set of ciphersuites
+     * available. Therefore we use a separate libctx with the default provider
+     * loaded into it. We run the same tests twice - once with the client side
+     * having the full set of ciphersuites and once with the server side.
+     */
+    if (clnt) {
+        cctx = SSL_CTX_new_with_libctx(tmplibctx, NULL, TLS_client_method());
+        if (!TEST_ptr(cctx))
+            goto end;
+    } else {
+        sctx = SSL_CTX_new_with_libctx(tmplibctx, NULL, TLS_server_method());
+        if (!TEST_ptr(sctx))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
                                        TLS_client_method(),
                                        TLS1_VERSION,
                                        shared_ciphers_data[tst].maxprot,
@@ -4729,7 +6923,11 @@ static int test_ssl_get_shared_ciphers(int tst)
         goto end;
 
     if (!TEST_ptr(SSL_get_shared_ciphers(serverssl, buf, sizeof(buf)))
-            || !TEST_int_eq(strcmp(buf, shared_ciphers_data[tst].shared), 0)) {
+            || !TEST_int_eq(strcmp(buf,
+                                   is_fips
+                                   ? shared_ciphers_data[tst].fipsshared
+                                   : shared_ciphers_data[tst].shared),
+                                   0)) {
         TEST_info("Shared ciphers are: %s\n", buf);
         goto end;
     }
@@ -4741,9 +6939,17 @@ static int test_ssl_get_shared_ciphers(int tst)
     SSL_free(clientssl);
     SSL_CTX_free(sctx);
     SSL_CTX_free(cctx);
+    OPENSSL_CTX_free(tmplibctx);
 
     return testresult;
 }
+
+static int test_ssl_get_shared_ciphers(int tst)
+{
+    return int_test_ssl_get_shared_ciphers(tst, 0)
+           && int_test_ssl_get_shared_ciphers(tst, 1);
+}
+
 
 static const char *appdata = "Hello World";
 static int gen_tick_called, dec_tick_called, tick_key_cb_called;
@@ -4802,22 +7008,66 @@ static SSL_TICKET_RETURN dec_tick_cb(SSL *s, SSL_SESSION *ss,
 
 }
 
+#ifndef OPENSSL_NO_DEPRECATED_3_0
 static int tick_key_cb(SSL *s, unsigned char key_name[16],
                        unsigned char iv[EVP_MAX_IV_LENGTH], EVP_CIPHER_CTX *ctx,
                        HMAC_CTX *hctx, int enc)
 {
     const unsigned char tick_aes_key[16] = "0123456789abcdef";
     const unsigned char tick_hmac_key[16] = "0123456789abcdef";
+    EVP_CIPHER *aes128cbc = EVP_CIPHER_fetch(libctx, "AES-128-CBC", NULL);
+    EVP_MD *sha256 = EVP_MD_fetch(libctx, "SHA-256", NULL);
+    int ret;
 
     tick_key_cb_called = 1;
     memset(iv, 0, AES_BLOCK_SIZE);
     memset(key_name, 0, 16);
-    if (!EVP_CipherInit_ex(ctx, EVP_aes_128_cbc(), NULL, tick_aes_key, iv, enc)
-            || !HMAC_Init_ex(hctx, tick_hmac_key, sizeof(tick_hmac_key),
-                             EVP_sha256(), NULL))
-        return -1;
+    if (aes128cbc == NULL
+            || sha256 == NULL
+            || !EVP_CipherInit_ex(ctx, aes128cbc, NULL, tick_aes_key, iv, enc)
+            || !HMAC_Init_ex(hctx, tick_hmac_key, sizeof(tick_hmac_key), sha256,
+                             NULL))
+        ret = -1;
+    else
+        ret = tick_key_renew ? 2 : 1;
 
-    return tick_key_renew ? 2 : 1;
+    EVP_CIPHER_free(aes128cbc);
+    EVP_MD_free(sha256);
+
+    return ret;
+}
+#endif
+
+static int tick_key_evp_cb(SSL *s, unsigned char key_name[16],
+                           unsigned char iv[EVP_MAX_IV_LENGTH],
+                           EVP_CIPHER_CTX *ctx, EVP_MAC_CTX *hctx, int enc)
+{
+    const unsigned char tick_aes_key[16] = "0123456789abcdef";
+    unsigned char tick_hmac_key[16] = "0123456789abcdef";
+    OSSL_PARAM params[3];
+    EVP_CIPHER *aes128cbc = EVP_CIPHER_fetch(libctx, "AES-128-CBC", NULL);
+    int ret;
+
+    tick_key_cb_called = 1;
+    memset(iv, 0, AES_BLOCK_SIZE);
+    memset(key_name, 0, 16);
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                                 "SHA256", 0);
+    params[1] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
+                                                  tick_hmac_key,
+                                                  sizeof(tick_hmac_key));
+    params[2] = OSSL_PARAM_construct_end();
+    if (aes128cbc == NULL
+            || !EVP_CipherInit_ex(ctx, aes128cbc, NULL, tick_aes_key, iv, enc)
+            || !EVP_MAC_CTX_set_params(hctx, params)
+            || !EVP_MAC_init(hctx))
+        ret = -1;
+    else
+        ret = tick_key_renew ? 2 : 1;
+
+    EVP_CIPHER_free(aes128cbc);
+
+    return ret;
 }
 
 /*
@@ -4830,10 +7080,14 @@ static int tick_key_cb(SSL *s, unsigned char key_name[16],
  * Test 5: TLSv1.3, no ticket key callback, ticket, no renewal
  * Test 6: TLSv1.2, no ticket key callback, ticket, renewal
  * Test 7: TLSv1.3, no ticket key callback, ticket, renewal
- * Test 8: TLSv1.2, ticket key callback, ticket, no renewal
- * Test 9: TLSv1.3, ticket key callback, ticket, no renewal
- * Test 10: TLSv1.2, ticket key callback, ticket, renewal
- * Test 11: TLSv1.3, ticket key callback, ticket, renewal
+ * Test 8: TLSv1.2, old ticket key callback, ticket, no renewal
+ * Test 9: TLSv1.3, old ticket key callback, ticket, no renewal
+ * Test 10: TLSv1.2, old ticket key callback, ticket, renewal
+ * Test 11: TLSv1.3, old ticket key callback, ticket, renewal
+ * Test 12: TLSv1.2, ticket key callback, ticket, no renewal
+ * Test 13: TLSv1.3, ticket key callback, ticket, no renewal
+ * Test 14: TLSv1.2, ticket key callback, ticket, renewal
+ * Test 15: TLSv1.3, ticket key callback, ticket, renewal
  */
 static int test_ticket_callbacks(int tst)
 {
@@ -4850,11 +7104,15 @@ static int test_ticket_callbacks(int tst)
     if (tst % 2 == 1)
         return 1;
 #endif
+#ifdef OPENSSL_NO_DEPRECATED_3_0
+    if (tst >= 8 && tst <= 11)
+        return 1;
+#endif
 
     gen_tick_called = dec_tick_called = tick_key_cb_called = 0;
 
     /* Which tests the ticket key callback should request renewal for */
-    if (tst == 10 || tst == 11)
+    if (tst == 10 || tst == 11 || tst == 14 || tst == 15)
         tick_key_renew = 1;
     else
         tick_key_renew = 0;
@@ -4885,7 +7143,7 @@ static int test_ticket_callbacks(int tst)
         tick_dec_ret = SSL_TICKET_RETURN_ABORT;
     }
 
-    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
                                        TLS_client_method(),
                                        TLS1_VERSION,
                                        ((tst % 2) == 0) ? TLS1_2_VERSION
@@ -4904,9 +7162,15 @@ static int test_ticket_callbacks(int tst)
                                                  NULL)))
         goto end;
 
-    if (tst >= 8
-            && !TEST_true(SSL_CTX_set_tlsext_ticket_key_cb(sctx, tick_key_cb)))
-        goto end;
+    if (tst >= 12) {
+        if (!TEST_true(SSL_CTX_set_tlsext_ticket_key_evp_cb(sctx, tick_key_evp_cb)))
+            goto end;
+#ifndef OPENSSL_NO_DEPRECATED_3_0
+    } else if (tst >= 8) {
+        if (!TEST_true(SSL_CTX_set_tlsext_ticket_key_cb(sctx, tick_key_cb)))
+            goto end;
+#endif
+    }
 
     if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
                                              NULL, NULL))
@@ -4971,13 +7235,1179 @@ static int test_ticket_callbacks(int tst)
     return testresult;
 }
 
+/*
+ * Test incorrect shutdown.
+ * Test 0: client does not shutdown properly,
+ *         server does not set SSL_OP_IGNORE_UNEXPECTED_EOF,
+ *         server should get SSL_ERROR_SSL
+ * Test 1: client does not shutdown properly,
+ *         server sets SSL_OP_IGNORE_UNEXPECTED_EOF,
+ *         server should get SSL_ERROR_ZERO_RETURN
+ */
+static int test_incorrect_shutdown(int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    char buf[80];
+    BIO *c2s;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(), 0, 0,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (tst == 1)
+        SSL_CTX_set_options(sctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                            NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE)))
+        goto end;
+
+    c2s = SSL_get_rbio(serverssl);
+    BIO_set_mem_eof_return(c2s, 0);
+
+    if (!TEST_false(SSL_read(serverssl, buf, sizeof(buf))))
+        goto end;
+
+    if (tst == 0 && !TEST_int_eq(SSL_get_error(serverssl, 0), SSL_ERROR_SSL) )
+        goto end;
+    if (tst == 1 && !TEST_int_eq(SSL_get_error(serverssl, 0), SSL_ERROR_ZERO_RETURN) )
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+/*
+ * Test bi-directional shutdown.
+ * Test 0: TLSv1.2
+ * Test 1: TLSv1.2, server continues to read/write after client shutdown
+ * Test 2: TLSv1.3, no pending NewSessionTicket messages
+ * Test 3: TLSv1.3, pending NewSessionTicket messages
+ * Test 4: TLSv1.3, server continues to read/write after client shutdown, server
+ *                  sends key update, client reads it
+ * Test 5: TLSv1.3, server continues to read/write after client shutdown, server
+ *                  sends CertificateRequest, client reads and ignores it
+ * Test 6: TLSv1.3, server continues to read/write after client shutdown, client
+ *                  doesn't read it
+ */
+static int test_shutdown(int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    char msg[] = "A test message";
+    char buf[80];
+    size_t written, readbytes;
+    SSL_SESSION *sess;
+
+#ifdef OPENSSL_NO_TLS1_2
+    if (tst <= 1)
+        return 1;
+#endif
+#ifdef OPENSSL_NO_TLS1_3
+    if (tst >= 2)
+        return 1;
+#endif
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       (tst <= 1) ? TLS1_2_VERSION
+                                                  : TLS1_3_VERSION,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (tst == 5)
+        SSL_CTX_set_post_handshake_auth(cctx, 1);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (tst == 3) {
+        if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
+                                                  SSL_ERROR_NONE, 1))
+                || !TEST_ptr_ne(sess = SSL_get_session(clientssl), NULL)
+                || !TEST_false(SSL_SESSION_is_resumable(sess)))
+            goto end;
+    } else if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                              SSL_ERROR_NONE))
+            || !TEST_ptr_ne(sess = SSL_get_session(clientssl), NULL)
+            || !TEST_true(SSL_SESSION_is_resumable(sess))) {
+        goto end;
+    }
+
+    if (!TEST_int_eq(SSL_shutdown(clientssl), 0))
+        goto end;
+
+    if (tst >= 4) {
+        /*
+         * Reading on the server after the client has sent close_notify should
+         * fail and provide SSL_ERROR_ZERO_RETURN
+         */
+        if (!TEST_false(SSL_read_ex(serverssl, buf, sizeof(buf), &readbytes))
+                || !TEST_int_eq(SSL_get_error(serverssl, 0),
+                                SSL_ERROR_ZERO_RETURN)
+                || !TEST_int_eq(SSL_get_shutdown(serverssl),
+                                SSL_RECEIVED_SHUTDOWN)
+                   /*
+                    * Even though we're shutdown on receive we should still be
+                    * able to write.
+                    */
+                || !TEST_true(SSL_write(serverssl, msg, sizeof(msg))))
+            goto end;
+        if (tst == 4
+                && !TEST_true(SSL_key_update(serverssl,
+                                             SSL_KEY_UPDATE_REQUESTED)))
+            goto end;
+        if (tst == 5) {
+            SSL_set_verify(serverssl, SSL_VERIFY_PEER, NULL);
+            if (!TEST_true(SSL_verify_client_post_handshake(serverssl)))
+                goto end;
+        }
+        if ((tst == 4 || tst == 5)
+                && !TEST_true(SSL_write(serverssl, msg, sizeof(msg))))
+            goto end;
+        if (!TEST_int_eq(SSL_shutdown(serverssl), 1))
+            goto end;
+        if (tst == 4 || tst == 5) {
+            /* Should still be able to read data from server */
+            if (!TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf),
+                                       &readbytes))
+                    || !TEST_size_t_eq(readbytes, sizeof(msg))
+                    || !TEST_int_eq(memcmp(msg, buf, readbytes), 0)
+                    || !TEST_true(SSL_read_ex(clientssl, buf, sizeof(buf),
+                                              &readbytes))
+                    || !TEST_size_t_eq(readbytes, sizeof(msg))
+                    || !TEST_int_eq(memcmp(msg, buf, readbytes), 0))
+                goto end;
+        }
+    }
+
+    /* Writing on the client after sending close_notify shouldn't be possible */
+    if (!TEST_false(SSL_write_ex(clientssl, msg, sizeof(msg), &written)))
+        goto end;
+
+    if (tst < 4) {
+        /*
+         * For these tests the client has sent close_notify but it has not yet
+         * been received by the server. The server has not sent close_notify
+         * yet.
+         */
+        if (!TEST_int_eq(SSL_shutdown(serverssl), 0)
+                   /*
+                    * Writing on the server after sending close_notify shouldn't
+                    * be possible.
+                    */
+                || !TEST_false(SSL_write_ex(serverssl, msg, sizeof(msg), &written))
+                || !TEST_int_eq(SSL_shutdown(clientssl), 1)
+                || !TEST_ptr_ne(sess = SSL_get_session(clientssl), NULL)
+                || !TEST_true(SSL_SESSION_is_resumable(sess))
+                || !TEST_int_eq(SSL_shutdown(serverssl), 1))
+            goto end;
+    } else if (tst == 4 || tst == 5) {
+        /*
+         * In this test the client has sent close_notify and it has been
+         * received by the server which has responded with a close_notify. The
+         * client needs to read the close_notify sent by the server.
+         */
+        if (!TEST_int_eq(SSL_shutdown(clientssl), 1)
+                || !TEST_ptr_ne(sess = SSL_get_session(clientssl), NULL)
+                || !TEST_true(SSL_SESSION_is_resumable(sess)))
+            goto end;
+    } else {
+        /*
+         * tst == 6
+         *
+         * The client has sent close_notify and is expecting a close_notify
+         * back, but instead there is application data first. The shutdown
+         * should fail with a fatal error.
+         */
+        if (!TEST_int_eq(SSL_shutdown(clientssl), -1)
+                || !TEST_int_eq(SSL_get_error(clientssl, -1), SSL_ERROR_SSL))
+            goto end;
+    }
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+#if !defined(OPENSSL_NO_TLS1_2) || !defined(OPENSSL_NO_TLS1_3)
+static int cert_cb_cnt;
+
+static int cert_cb(SSL *s, void *arg)
+{
+    SSL_CTX *ctx = (SSL_CTX *)arg;
+    BIO *in = NULL;
+    EVP_PKEY *pkey = NULL;
+    X509 *x509 = NULL, *rootx = NULL;
+    STACK_OF(X509) *chain = NULL;
+    char *rootfile = NULL, *ecdsacert = NULL, *ecdsakey = NULL;
+    int ret = 0;
+
+    if (cert_cb_cnt == 0) {
+        /* Suspend the handshake */
+        cert_cb_cnt++;
+        return -1;
+    } else if (cert_cb_cnt == 1) {
+        /*
+         * Update the SSL_CTX, set the certificate and private key and then
+         * continue the handshake normally.
+         */
+        if (ctx != NULL && !TEST_ptr(SSL_set_SSL_CTX(s, ctx)))
+            return 0;
+
+        if (!TEST_true(SSL_use_certificate_file(s, cert, SSL_FILETYPE_PEM))
+                || !TEST_true(SSL_use_PrivateKey_file(s, privkey,
+                                                      SSL_FILETYPE_PEM))
+                || !TEST_true(SSL_check_private_key(s)))
+            return 0;
+        cert_cb_cnt++;
+        return 1;
+    } else if (cert_cb_cnt == 3) {
+        int rv;
+
+        rootfile = test_mk_file_path(certsdir, "rootcert.pem");
+        ecdsacert = test_mk_file_path(certsdir, "server-ecdsa-cert.pem");
+        ecdsakey = test_mk_file_path(certsdir, "server-ecdsa-key.pem");
+        if (!TEST_ptr(rootfile) || !TEST_ptr(ecdsacert) || !TEST_ptr(ecdsakey))
+            goto out;
+        chain = sk_X509_new_null();
+        if (!TEST_ptr(chain))
+            goto out;
+        if (!TEST_ptr(in = BIO_new(BIO_s_file()))
+                || !TEST_int_ge(BIO_read_filename(in, rootfile), 0)
+                || !TEST_ptr(rootx = X509_new_with_libctx(libctx, NULL))
+                || !TEST_ptr(PEM_read_bio_X509(in, &rootx, NULL, NULL))
+                || !TEST_true(sk_X509_push(chain, rootx)))
+            goto out;
+        rootx = NULL;
+        BIO_free(in);
+        if (!TEST_ptr(in = BIO_new(BIO_s_file()))
+                || !TEST_int_ge(BIO_read_filename(in, ecdsacert), 0)
+                || !TEST_ptr(x509 = X509_new_with_libctx(libctx, NULL))
+                || !TEST_ptr(PEM_read_bio_X509(in, &x509, NULL, NULL)))
+            goto out;
+        BIO_free(in);
+        if (!TEST_ptr(in = BIO_new(BIO_s_file()))
+                || !TEST_int_ge(BIO_read_filename(in, ecdsakey), 0)
+                || !TEST_ptr(pkey = PEM_read_bio_PrivateKey(in, NULL, NULL, NULL)))
+            goto out;
+        rv = SSL_check_chain(s, x509, pkey, chain);
+        /*
+         * If the cert doesn't show as valid here (e.g., because we don't
+         * have any shared sigalgs), then we will not set it, and there will
+         * be no certificate at all on the SSL or SSL_CTX.  This, in turn,
+         * will cause tls_choose_sigalgs() to fail the connection.
+         */
+        if ((rv & (CERT_PKEY_VALID | CERT_PKEY_CA_SIGNATURE))
+                == (CERT_PKEY_VALID | CERT_PKEY_CA_SIGNATURE)) {
+            if (!SSL_use_cert_and_key(s, x509, pkey, NULL, 1))
+                goto out;
+        }
+
+        ret = 1;
+    }
+
+    /* Abort the handshake */
+ out:
+    OPENSSL_free(ecdsacert);
+    OPENSSL_free(ecdsakey);
+    OPENSSL_free(rootfile);
+    BIO_free(in);
+    EVP_PKEY_free(pkey);
+    X509_free(x509);
+    X509_free(rootx);
+    sk_X509_pop_free(chain, X509_free);
+    return ret;
+}
+
+/*
+ * Test the certificate callback.
+ * Test 0: Callback fails
+ * Test 1: Success - no SSL_set_SSL_CTX() in the callback
+ * Test 2: Success - SSL_set_SSL_CTX() in the callback
+ * Test 3: Success - Call SSL_check_chain from the callback
+ * Test 4: Failure - SSL_check_chain fails from callback due to bad cert in the
+ *                   chain
+ * Test 5: Failure - SSL_check_chain fails from callback due to bad ee cert
+ */
+static int test_cert_cb_int(int prot, int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL, *snictx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0, ret;
+
+#ifdef OPENSSL_NO_EC
+    /* We use an EC cert in these tests, so we skip in a no-ec build */
+    if (tst >= 3)
+        return 1;
+#endif
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       prot,
+                                       &sctx, &cctx, NULL, NULL)))
+        goto end;
+
+    if (tst == 0)
+        cert_cb_cnt = -1;
+    else if (tst >= 3)
+        cert_cb_cnt = 3;
+    else
+        cert_cb_cnt = 0;
+
+    if (tst == 2)
+        snictx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_cert_cb(sctx, cert_cb, snictx);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL)))
+        goto end;
+
+    if (tst == 4) {
+        /*
+         * We cause SSL_check_chain() to fail by specifying sig_algs that
+         * the chain doesn't meet (the root uses an RSA cert)
+         */
+        if (!TEST_true(SSL_set1_sigalgs_list(clientssl,
+                                             "ecdsa_secp256r1_sha256")))
+            goto end;
+    } else if (tst == 5) {
+        /*
+         * We cause SSL_check_chain() to fail by specifying sig_algs that
+         * the ee cert doesn't meet (the ee uses an ECDSA cert)
+         */
+        if (!TEST_true(SSL_set1_sigalgs_list(clientssl,
+                           "rsa_pss_rsae_sha256:rsa_pkcs1_sha256")))
+            goto end;
+    }
+
+    ret = create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE);
+    if (!TEST_true(tst == 0 || tst == 4 || tst == 5 ? !ret : ret)
+            || (tst > 0
+                && !TEST_int_eq((cert_cb_cnt - 2) * (cert_cb_cnt - 3), 0))) {
+        goto end;
+    }
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    SSL_CTX_free(snictx);
+
+    return testresult;
+}
+#endif
+
+static int test_cert_cb(int tst)
+{
+    int testresult = 1;
+
+#ifndef OPENSSL_NO_TLS1_2
+    testresult &= test_cert_cb_int(TLS1_2_VERSION, tst);
+#endif
+#ifndef OPENSSL_NO_TLS1_3
+    testresult &= test_cert_cb_int(TLS1_3_VERSION, tst);
+#endif
+
+    return testresult;
+}
+
+static int client_cert_cb(SSL *ssl, X509 **x509, EVP_PKEY **pkey)
+{
+    X509 *xcert;
+    EVP_PKEY *privpkey;
+    BIO *in = NULL;
+    BIO *priv_in = NULL;
+
+    /* Check that SSL_get0_peer_certificate() returns something sensible */
+    if (!TEST_ptr(SSL_get0_peer_certificate(ssl)))
+        return 0;
+
+    in = BIO_new_file(cert, "r");
+    if (!TEST_ptr(in))
+        return 0;
+
+    if (!TEST_ptr(xcert = X509_new_with_libctx(libctx, NULL))
+            || !TEST_ptr(PEM_read_bio_X509(in, &xcert, NULL, NULL))
+            || !TEST_ptr(priv_in = BIO_new_file(privkey, "r"))
+            || !TEST_ptr(privpkey = PEM_read_bio_PrivateKey(priv_in, NULL, NULL,
+                                                            NULL)))
+        goto err;
+
+    *x509 = xcert;
+    *pkey = privpkey;
+
+    BIO_free(in);
+    BIO_free(priv_in);
+    return 1;
+err:
+    X509_free(xcert);
+    BIO_free(in);
+    BIO_free(priv_in);
+    return 0;
+}
+
+static int verify_cb(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+    return 1;
+}
+
+static int test_client_cert_cb(int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+
+#ifdef OPENSSL_NO_TLS1_2
+    if (tst == 0)
+        return 1;
+#endif
+#ifdef OPENSSL_NO_TLS1_3
+    if (tst == 1)
+        return 1;
+#endif
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       tst == 0 ? TLS1_2_VERSION
+                                                : TLS1_3_VERSION,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    /*
+     * Test that setting a client_cert_cb results in a client certificate being
+     * sent.
+     */
+    SSL_CTX_set_client_cert_cb(cctx, client_cert_cb);
+    SSL_CTX_set_verify(sctx,
+                       SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       verify_cb);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE)))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+#if !defined(OPENSSL_NO_TLS1_2) || !defined(OPENSSL_NO_TLS1_3)
+/*
+ * Test setting certificate authorities on both client and server.
+ *
+ * Test 0: SSL_CTX_set0_CA_list() only
+ * Test 1: Both SSL_CTX_set0_CA_list() and SSL_CTX_set_client_CA_list()
+ * Test 2: Only SSL_CTX_set_client_CA_list()
+ */
+static int test_ca_names_int(int prot, int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    size_t i;
+    X509_NAME *name[] = { NULL, NULL, NULL, NULL };
+    char *strnames[] = { "Jack", "Jill", "John", "Joanne" };
+    STACK_OF(X509_NAME) *sk1 = NULL, *sk2 = NULL;
+    const STACK_OF(X509_NAME) *sktmp = NULL;
+
+    for (i = 0; i < OSSL_NELEM(name); i++) {
+        name[i] = X509_NAME_new();
+        if (!TEST_ptr(name[i])
+                || !TEST_true(X509_NAME_add_entry_by_txt(name[i], "CN",
+                                                         MBSTRING_ASC,
+                                                         (unsigned char *)
+                                                         strnames[i],
+                                                         -1, -1, 0)))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       prot,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    SSL_CTX_set_verify(sctx, SSL_VERIFY_PEER, NULL);
+
+    if (tst == 0 || tst == 1) {
+        if (!TEST_ptr(sk1 = sk_X509_NAME_new_null())
+                || !TEST_true(sk_X509_NAME_push(sk1, X509_NAME_dup(name[0])))
+                || !TEST_true(sk_X509_NAME_push(sk1, X509_NAME_dup(name[1])))
+                || !TEST_ptr(sk2 = sk_X509_NAME_new_null())
+                || !TEST_true(sk_X509_NAME_push(sk2, X509_NAME_dup(name[0])))
+                || !TEST_true(sk_X509_NAME_push(sk2, X509_NAME_dup(name[1]))))
+            goto end;
+
+        SSL_CTX_set0_CA_list(sctx, sk1);
+        SSL_CTX_set0_CA_list(cctx, sk2);
+        sk1 = sk2 = NULL;
+    }
+    if (tst == 1 || tst == 2) {
+        if (!TEST_ptr(sk1 = sk_X509_NAME_new_null())
+                || !TEST_true(sk_X509_NAME_push(sk1, X509_NAME_dup(name[2])))
+                || !TEST_true(sk_X509_NAME_push(sk1, X509_NAME_dup(name[3])))
+                || !TEST_ptr(sk2 = sk_X509_NAME_new_null())
+                || !TEST_true(sk_X509_NAME_push(sk2, X509_NAME_dup(name[2])))
+                || !TEST_true(sk_X509_NAME_push(sk2, X509_NAME_dup(name[3]))))
+            goto end;
+
+        SSL_CTX_set_client_CA_list(sctx, sk1);
+        SSL_CTX_set_client_CA_list(cctx, sk2);
+        sk1 = sk2 = NULL;
+    }
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL))
+            || !TEST_true(create_ssl_connection(serverssl, clientssl,
+                                                SSL_ERROR_NONE)))
+        goto end;
+
+    /*
+     * We only expect certificate authorities to have been sent to the server
+     * if we are using TLSv1.3 and SSL_set0_CA_list() was used
+     */
+    sktmp = SSL_get0_peer_CA_list(serverssl);
+    if (prot == TLS1_3_VERSION
+            && (tst == 0 || tst == 1)) {
+        if (!TEST_ptr(sktmp)
+                || !TEST_int_eq(sk_X509_NAME_num(sktmp), 2)
+                || !TEST_int_eq(X509_NAME_cmp(sk_X509_NAME_value(sktmp, 0),
+                                              name[0]), 0)
+                || !TEST_int_eq(X509_NAME_cmp(sk_X509_NAME_value(sktmp, 1),
+                                              name[1]), 0))
+            goto end;
+    } else if (!TEST_ptr_null(sktmp)) {
+        goto end;
+    }
+
+    /*
+     * In all tests we expect certificate authorities to have been sent to the
+     * client. However, SSL_set_client_CA_list() should override
+     * SSL_set0_CA_list()
+     */
+    sktmp = SSL_get0_peer_CA_list(clientssl);
+    if (!TEST_ptr(sktmp)
+            || !TEST_int_eq(sk_X509_NAME_num(sktmp), 2)
+            || !TEST_int_eq(X509_NAME_cmp(sk_X509_NAME_value(sktmp, 0),
+                                          name[tst == 0 ? 0 : 2]), 0)
+            || !TEST_int_eq(X509_NAME_cmp(sk_X509_NAME_value(sktmp, 1),
+                                          name[tst == 0 ? 1 : 3]), 0))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    for (i = 0; i < OSSL_NELEM(name); i++)
+        X509_NAME_free(name[i]);
+    sk_X509_NAME_pop_free(sk1, X509_NAME_free);
+    sk_X509_NAME_pop_free(sk2, X509_NAME_free);
+
+    return testresult;
+}
+#endif
+
+static int test_ca_names(int tst)
+{
+    int testresult = 1;
+
+#ifndef OPENSSL_NO_TLS1_2
+    testresult &= test_ca_names_int(TLS1_2_VERSION, tst);
+#endif
+#ifndef OPENSSL_NO_TLS1_3
+    testresult &= test_ca_names_int(TLS1_3_VERSION, tst);
+#endif
+
+    return testresult;
+}
+
+#ifndef OPENSSL_NO_TLS1_2
+static const char *multiblock_cipherlist_data[]=
+{
+    "AES128-SHA",
+    "AES128-SHA256",
+    "AES256-SHA",
+    "AES256-SHA256",
+};
+
+/* Reduce the fragment size - so the multiblock test buffer can be small */
+# define MULTIBLOCK_FRAGSIZE 512
+
+static int test_multiblock_write(int test_index)
+{
+    static const char *fetchable_ciphers[]=
+    {
+        "AES-128-CBC-HMAC-SHA1",
+        "AES-128-CBC-HMAC-SHA256",
+        "AES-256-CBC-HMAC-SHA1",
+        "AES-256-CBC-HMAC-SHA256"
+    };
+    const char *cipherlist = multiblock_cipherlist_data[test_index];
+    const SSL_METHOD *smeth = TLS_server_method();
+    const SSL_METHOD *cmeth = TLS_client_method();
+    int min_version = TLS1_VERSION;
+    int max_version = TLS1_2_VERSION; /* Don't select TLS1_3 */
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+
+    /*
+     * Choose a buffer large enough to perform a multi-block operation
+     * i.e: write_len >= 4 * frag_size
+     * 9 * is chosen so that multiple multiblocks are used + some leftover.
+     */
+    unsigned char msg[MULTIBLOCK_FRAGSIZE * 9];
+    unsigned char buf[sizeof(msg)], *p = buf;
+    size_t readbytes, written, len;
+    EVP_CIPHER *ciph = NULL;
+
+    /*
+     * Check if the cipher exists before attempting to use it since it only has
+     * a hardware specific implementation.
+     */
+    ciph = EVP_CIPHER_fetch(NULL, fetchable_ciphers[test_index], "");
+    if (ciph == NULL) {
+        TEST_skip("Multiblock cipher is not available for %s", cipherlist);
+        return 1;
+    }
+    EVP_CIPHER_free(ciph);
+
+    /* Set up a buffer with some data that will be sent to the client */
+    RAND_bytes(msg, sizeof(msg));
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, smeth, cmeth, min_version,
+                                       max_version, &sctx, &cctx, cert,
+                                       privkey)))
+        goto end;
+
+    if (!TEST_true(SSL_CTX_set_max_send_fragment(sctx, MULTIBLOCK_FRAGSIZE)))
+        goto end;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                      NULL, NULL)))
+            goto end;
+
+    /* settings to force it to use AES-CBC-HMAC_SHA */
+    SSL_set_options(serverssl, SSL_OP_NO_ENCRYPT_THEN_MAC);
+    if (!TEST_true(SSL_CTX_set_cipher_list(cctx, cipherlist)))
+       goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    if (!TEST_true(SSL_write_ex(serverssl, msg, sizeof(msg), &written))
+        || !TEST_size_t_eq(written, sizeof(msg)))
+        goto end;
+
+    len = written;
+    while (len > 0) {
+        if (!TEST_true(SSL_read_ex(clientssl, p, MULTIBLOCK_FRAGSIZE, &readbytes)))
+            goto end;
+        p += readbytes;
+        len -= readbytes;
+    }
+    if (!TEST_mem_eq(msg, sizeof(msg), buf, sizeof(buf)))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+#endif /* OPENSSL_NO_TLS1_2 */
+
+/*
+ * Test 0: Client sets servername and server acknowledges it (TLSv1.2)
+ * Test 1: Client sets servername and server does not acknowledge it (TLSv1.2)
+ * Test 2: Client sets inconsistent servername on resumption (TLSv1.2)
+ * Test 3: Client does not set servername on initial handshake (TLSv1.2)
+ * Test 4: Client does not set servername on resumption handshake (TLSv1.2)
+ * Test 5: Client sets servername and server acknowledges it (TLSv1.3)
+ * Test 6: Client sets servername and server does not acknowledge it (TLSv1.3)
+ * Test 7: Client sets inconsistent servername on resumption (TLSv1.3)
+ * Test 8: Client does not set servername on initial handshake(TLSv1.3)
+ * Test 9: Client does not set servername on resumption handshake (TLSv1.3)
+ */
+static int test_servername(int tst)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    SSL_SESSION *sess = NULL;
+    const char *sexpectedhost = NULL, *cexpectedhost = NULL;
+
+#ifdef OPENSSL_NO_TLS1_2
+    if (tst <= 4)
+        return 1;
+#endif
+#ifdef OPENSSL_NO_TLS1_3
+    if (tst >= 5)
+        return 1;
+#endif
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       (tst <= 4) ? TLS1_2_VERSION
+                                                  : TLS1_3_VERSION,
+                                       &sctx, &cctx, cert, privkey))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (tst != 1 && tst != 6) {
+        if (!TEST_true(SSL_CTX_set_tlsext_servername_callback(sctx,
+                                                              hostname_cb)))
+            goto end;
+    }
+
+    if (tst != 3 && tst != 8) {
+        if (!TEST_true(SSL_set_tlsext_host_name(clientssl, "goodhost")))
+            goto end;
+        sexpectedhost = cexpectedhost = "goodhost";
+    }
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    if (!TEST_str_eq(SSL_get_servername(clientssl, TLSEXT_NAMETYPE_host_name),
+                     cexpectedhost)
+            || !TEST_str_eq(SSL_get_servername(serverssl,
+                                               TLSEXT_NAMETYPE_host_name),
+                            sexpectedhost))
+        goto end;
+
+    /* Now repeat with a resumption handshake */
+
+    if (!TEST_int_eq(SSL_shutdown(clientssl), 0)
+            || !TEST_ptr_ne(sess = SSL_get1_session(clientssl), NULL)
+            || !TEST_true(SSL_SESSION_is_resumable(sess))
+            || !TEST_int_eq(SSL_shutdown(serverssl), 0))
+        goto end;
+
+    SSL_free(clientssl);
+    SSL_free(serverssl);
+    clientssl = serverssl = NULL;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl, NULL,
+                                      NULL)))
+        goto end;
+
+    if (!TEST_true(SSL_set_session(clientssl, sess)))
+        goto end;
+
+    sexpectedhost = cexpectedhost = "goodhost";
+    if (tst == 2 || tst == 7) {
+        /* Set an inconsistent hostname */
+        if (!TEST_true(SSL_set_tlsext_host_name(clientssl, "altgoodhost")))
+            goto end;
+        /*
+         * In TLSv1.2 we expect the hostname from the original handshake, in
+         * TLSv1.3 we expect the hostname from this handshake
+         */
+        if (tst == 7)
+            sexpectedhost = cexpectedhost = "altgoodhost";
+
+        if (!TEST_str_eq(SSL_get_servername(clientssl,
+                                            TLSEXT_NAMETYPE_host_name),
+                         "altgoodhost"))
+            goto end;
+    } else if (tst == 4 || tst == 9) {
+        /*
+         * A TLSv1.3 session does not associate a session with a servername,
+         * but a TLSv1.2 session does.
+         */
+        if (tst == 9)
+            sexpectedhost = cexpectedhost = NULL;
+
+        if (!TEST_str_eq(SSL_get_servername(clientssl,
+                                            TLSEXT_NAMETYPE_host_name),
+                         cexpectedhost))
+            goto end;
+    } else {
+        if (!TEST_true(SSL_set_tlsext_host_name(clientssl, "goodhost")))
+            goto end;
+        /*
+         * In a TLSv1.2 resumption where the hostname was not acknowledged
+         * we expect the hostname on the server to be empty. On the client we
+         * return what was requested in this case.
+         *
+         * Similarly if the client didn't set a hostname on an original TLSv1.2
+         * session but is now, the server hostname will be empty, but the client
+         * is as we set it.
+         */
+        if (tst == 1 || tst == 3)
+            sexpectedhost = NULL;
+
+        if (!TEST_str_eq(SSL_get_servername(clientssl,
+                                            TLSEXT_NAMETYPE_host_name),
+                         "goodhost"))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    if (!TEST_true(SSL_session_reused(clientssl))
+            || !TEST_true(SSL_session_reused(serverssl))
+            || !TEST_str_eq(SSL_get_servername(clientssl,
+                                               TLSEXT_NAMETYPE_host_name),
+                            cexpectedhost)
+            || !TEST_str_eq(SSL_get_servername(serverssl,
+                                               TLSEXT_NAMETYPE_host_name),
+                            sexpectedhost))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_SESSION_free(sess);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+
+#ifndef OPENSSL_NO_EC
+/*
+ * Test that if signature algorithms are not available, then we do not offer or
+ * accept them.
+ * Test 0: Two RSA sig algs available: both RSA sig algs shared
+ * Test 1: The client only has SHA2-256: only SHA2-256 algorithms shared
+ * Test 2: The server only has SHA2-256: only SHA2-256 algorithms shared
+ * Test 3: An RSA and an ECDSA sig alg available: both sig algs shared
+ * Test 4: The client only has an ECDSA sig alg: only ECDSA algorithms shared
+ * Test 5: The server only has an ECDSA sig alg: only ECDSA algorithms shared
+ */
+static int test_sigalgs_available(int idx)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    OPENSSL_CTX *tmpctx = OPENSSL_CTX_new();
+    OPENSSL_CTX *clientctx = libctx, *serverctx = libctx;
+    OSSL_PROVIDER *filterprov = NULL;
+    int sig, hash;
+
+    if (!TEST_ptr(tmpctx))
+        goto end;
+
+    if (idx != 0 && idx != 3) {
+        if (!TEST_true(OSSL_PROVIDER_add_builtin(tmpctx, "filter",
+                                                 filter_provider_init)))
+            goto end;
+
+        filterprov = OSSL_PROVIDER_load(tmpctx, "filter");
+        if (!TEST_ptr(filterprov))
+            goto end;
+
+        if (idx < 3) {
+            /*
+             * Only enable SHA2-256 so rsa_pss_rsae_sha384 should not be offered
+             * or accepted for the peer that uses this libctx. Note that libssl
+             * *requires* SHA2-256 to be available so we cannot disable that. We
+             * also need SHA1 for our certificate.
+             */
+            if (!TEST_true(filter_provider_set_filter(OSSL_OP_DIGEST,
+                                                      "SHA2-256:SHA1")))
+                goto end;
+        } else {
+            if (!TEST_true(filter_provider_set_filter(OSSL_OP_SIGNATURE,
+                                                      "ECDSA"))
+                    || !TEST_true(filter_provider_set_filter(OSSL_OP_KEYMGMT,
+                                                             "EC:X25519:X448")))
+                goto end;
+        }
+
+        if (idx == 1 || idx == 4)
+            clientctx = tmpctx;
+        else
+            serverctx = tmpctx;
+    }
+
+    cctx = SSL_CTX_new_with_libctx(clientctx, NULL, TLS_client_method());
+    sctx = SSL_CTX_new_with_libctx(serverctx, NULL, TLS_server_method());
+    if (!TEST_ptr(cctx) || !TEST_ptr(sctx))
+        goto end;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_VERSION,
+                                       0,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (idx < 3) {
+        if (!SSL_CTX_set1_sigalgs_list(cctx,
+                                       "rsa_pss_rsae_sha384"
+                                       ":rsa_pss_rsae_sha256")
+                || !SSL_CTX_set1_sigalgs_list(sctx,
+                                              "rsa_pss_rsae_sha384"
+                                              ":rsa_pss_rsae_sha256"))
+            goto end;
+    } else {
+        if (!SSL_CTX_set1_sigalgs_list(cctx, "rsa_pss_rsae_sha256:ECDSA+SHA256")
+                || !SSL_CTX_set1_sigalgs_list(sctx,
+                                              "rsa_pss_rsae_sha256:ECDSA+SHA256"))
+            goto end;
+    }
+
+    if (!TEST_int_eq(SSL_CTX_use_certificate_file(sctx, cert2,
+                                                  SSL_FILETYPE_PEM), 1)
+            || !TEST_int_eq(SSL_CTX_use_PrivateKey_file(sctx,
+                                                        privkey2,
+                                                        SSL_FILETYPE_PEM), 1)
+            || !TEST_int_eq(SSL_CTX_check_private_key(sctx), 1))
+        goto end;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    /* For tests 0 and 3 we expect 2 shared sigalgs, otherwise exactly 1 */
+    if (!TEST_int_eq(SSL_get_shared_sigalgs(serverssl, 0, &sig, &hash, NULL,
+                                            NULL, NULL),
+                     (idx == 0 || idx == 3) ? 2 : 1))
+        goto end;
+
+    if (!TEST_int_eq(hash, idx == 0 ? NID_sha384 : NID_sha256))
+        goto end;
+
+    if (!TEST_int_eq(sig, (idx == 4 || idx == 5) ? EVP_PKEY_EC
+                                                 : NID_rsassaPss))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OSSL_PROVIDER_unload(filterprov);
+    OPENSSL_CTX_free(tmpctx);
+
+    return testresult;
+}
+#endif /* OPENSSL_NO_EC */
+
+#ifndef OPENSSL_NO_TLS1_3
+static int test_pluggable_group(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int testresult = 0;
+    OSSL_PROVIDER *tlsprov = OSSL_PROVIDER_load(libctx, "tls-provider");
+    /* Check that we are not impacted by a provider without any groups */
+    OSSL_PROVIDER *legacyprov = OSSL_PROVIDER_load(libctx, "legacy");
+
+    if (!TEST_ptr(tlsprov) || !TEST_ptr(legacyprov))
+        goto end;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       TLS1_3_VERSION,
+                                       TLS1_3_VERSION,
+                                       &sctx, &cctx, cert, privkey))
+            || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(SSL_set1_groups_list(serverssl, "xorgroup"))
+            || !TEST_true(SSL_set1_groups_list(clientssl, "xorgroup")))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OSSL_PROVIDER_unload(tlsprov);
+    OSSL_PROVIDER_unload(legacyprov);
+
+    return testresult;
+}
+#endif
+
+#ifndef OPENSSL_NO_TLS1_2
+static int test_ssl_dup(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL, *client2ssl = NULL;
+    int testresult = 0;
+    BIO *rbio = NULL, *wbio = NULL;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                                       TLS_client_method(),
+                                       0,
+                                       0,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                             NULL, NULL)))
+        goto end;
+
+    if (!TEST_true(SSL_set_min_proto_version(clientssl, TLS1_2_VERSION))
+            || !TEST_true(SSL_set_max_proto_version(clientssl, TLS1_2_VERSION)))
+        goto end;
+
+    client2ssl = SSL_dup(clientssl);
+    rbio = SSL_get_rbio(clientssl);
+    if (!TEST_ptr(rbio)
+            || !TEST_true(BIO_up_ref(rbio)))
+        goto end;
+    SSL_set0_rbio(client2ssl, rbio);
+    rbio = NULL;
+
+    wbio = SSL_get_wbio(clientssl);
+    if (!TEST_ptr(wbio) || !TEST_true(BIO_up_ref(wbio)))
+        goto end;
+    SSL_set0_wbio(client2ssl, wbio);
+    rbio = NULL;
+
+    if (!TEST_ptr(client2ssl)
+               /* Handshake not started so pointers should be different */
+            || !TEST_ptr_ne(clientssl, client2ssl))
+        goto end;
+
+    if (!TEST_int_eq(SSL_get_min_proto_version(client2ssl), TLS1_2_VERSION)
+            || !TEST_int_eq(SSL_get_max_proto_version(client2ssl), TLS1_2_VERSION))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, client2ssl, SSL_ERROR_NONE)))
+        goto end;
+
+    SSL_free(clientssl);
+    clientssl = SSL_dup(client2ssl);
+    if (!TEST_ptr(clientssl)
+               /* Handshake has finished so pointers should be the same */
+            || !TEST_ptr_eq(clientssl, client2ssl))
+        goto end;
+
+    testresult = 1;
+
+ end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_free(client2ssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
+#endif
+
+OPT_TEST_DECLARE_USAGE("certfile privkeyfile srpvfile tmpfile provider config\n")
+
 int setup_tests(void)
 {
-    if (!TEST_ptr(cert = test_get_argument(0))
-            || !TEST_ptr(privkey = test_get_argument(1))
-            || !TEST_ptr(srpvfile = test_get_argument(2))
-            || !TEST_ptr(tmpfilename = test_get_argument(3)))
+    char *modulename;
+    char *configfile;
+
+    libctx = OPENSSL_CTX_new();
+    if (!TEST_ptr(libctx))
         return 0;
+
+    defctxnull = OSSL_PROVIDER_load(NULL, "null");
+
+    /*
+     * Verify that the default and fips providers in the default libctx are not
+     * available
+     */
+    if (!TEST_false(OSSL_PROVIDER_available(NULL, "default"))
+            || !TEST_false(OSSL_PROVIDER_available(NULL, "fips")))
+        return 0;
+
+    if (!test_skip_common_options()) {
+        TEST_error("Error parsing test options\n");
+        return 0;
+    }
+
+    if (!TEST_ptr(certsdir = test_get_argument(0))
+            || !TEST_ptr(srpvfile = test_get_argument(1))
+            || !TEST_ptr(tmpfilename = test_get_argument(2))
+            || !TEST_ptr(modulename = test_get_argument(3))
+            || !TEST_ptr(configfile = test_get_argument(4)))
+        return 0;
+
+    if (!TEST_true(OPENSSL_CTX_load_config(libctx, configfile)))
+        return 0;
+
+    /* Check we have the expected provider available */
+    if (!TEST_true(OSSL_PROVIDER_available(libctx, modulename)))
+        return 0;
+
+    /* Check the default provider is not available */
+    if (strcmp(modulename, "default") != 0
+            && !TEST_false(OSSL_PROVIDER_available(libctx, "default")))
+        return 0;
+
+    if (strcmp(modulename, "fips") == 0)
+        is_fips = 1;
+
+    /*
+     * We add, but don't load the test "tls-provider". We'll load it when we
+     * need it.
+     */
+    if (!TEST_true(OSSL_PROVIDER_add_builtin(libctx, "tls-provider",
+                                             tls_provider_init)))
+        return 0;
+
 
     if (getenv("OPENSSL_TEST_GETCOUNTS") != NULL) {
 #ifdef OPENSSL_NO_CRYPTO_MDEBUG
@@ -4995,19 +8425,46 @@ int setup_tests(void)
 #endif
     }
 
+    cert = test_mk_file_path(certsdir, "servercert.pem");
+    if (cert == NULL)
+        goto err;
+
+    privkey = test_mk_file_path(certsdir, "serverkey.pem");
+    if (privkey == NULL)
+        goto err;
+
+    cert2 = test_mk_file_path(certsdir, "server-ecdsa-cert.pem");
+    if (cert2 == NULL)
+        goto err;
+
+    privkey2 = test_mk_file_path(certsdir, "server-ecdsa-key.pem");
+    if (privkey2 == NULL)
+        goto err;
+
+#if !defined(OPENSSL_NO_KTLS) && !defined(OPENSSL_NO_SOCK)
+#if !defined(OPENSSL_NO_TLS1_2) || !defined(OPENSSL_NO_TLS1_3)
+    ADD_ALL_TESTS(test_ktls, 32);
+    ADD_ALL_TESTS(test_ktls_sendfile_anytls, 6);
+#endif
+#endif
     ADD_TEST(test_large_message_tls);
     ADD_TEST(test_large_message_tls_read_ahead);
 #ifndef OPENSSL_NO_DTLS
     ADD_TEST(test_large_message_dtls);
 #endif
+    ADD_TEST(test_cleanse_plaintext);
 #ifndef OPENSSL_NO_OCSP
     ADD_TEST(test_tlsext_status_type);
 #endif
     ADD_TEST(test_session_with_only_int_cache);
     ADD_TEST(test_session_with_only_ext_cache);
     ADD_TEST(test_session_with_both_cache);
+    ADD_TEST(test_session_wo_ca_names);
 #ifndef OPENSSL_NO_TLS1_3
-    ADD_ALL_TESTS(test_tickets, 3);
+    ADD_ALL_TESTS(test_stateful_tickets, 3);
+    ADD_ALL_TESTS(test_stateless_tickets, 3);
+    ADD_TEST(test_psk_tickets);
+    ADD_ALL_TESTS(test_extra_tickets, 6);
 #endif
     ADD_ALL_TESTS(test_ssl_set_bio, TOTAL_SSL_SET_BIO_TESTS);
     ADD_TEST(test_ssl_bio_pop_next_bio);
@@ -5023,6 +8480,8 @@ int setup_tests(void)
 #endif
 #ifndef OPENSSL_NO_TLS1_2
     ADD_TEST(test_client_hello_cb);
+    ADD_TEST(test_no_ems);
+    ADD_TEST(test_ccs_change_cipher);
 #endif
 #ifndef OPENSSL_NO_TLS1_3
     ADD_ALL_TESTS(test_early_data_read_write, 3);
@@ -5033,8 +8492,11 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_early_data_replay, 2);
     ADD_ALL_TESTS(test_early_data_skip, 3);
     ADD_ALL_TESTS(test_early_data_skip_hrr, 3);
+    ADD_ALL_TESTS(test_early_data_skip_hrr_fail, 3);
+    ADD_ALL_TESTS(test_early_data_skip_abort, 3);
     ADD_ALL_TESTS(test_early_data_not_sent, 3);
     ADD_ALL_TESTS(test_early_data_psk, 8);
+    ADD_ALL_TESTS(test_early_data_psk_with_all_ciphers, 5);
     ADD_ALL_TESTS(test_early_data_not_expected, 3);
 # ifndef OPENSSL_NO_TLS1_2
     ADD_ALL_TESTS(test_early_data_tls1_2, 3);
@@ -5043,11 +8505,19 @@ int setup_tests(void)
 #ifndef OPENSSL_NO_TLS1_3
     ADD_ALL_TESTS(test_set_ciphersuite, 10);
     ADD_TEST(test_ciphersuite_change);
-#ifdef OPENSSL_NO_PSK
+    ADD_ALL_TESTS(test_tls13_ciphersuite, 4);
+# ifdef OPENSSL_NO_PSK
     ADD_ALL_TESTS(test_tls13_psk, 1);
-#else
+# else
     ADD_ALL_TESTS(test_tls13_psk, 4);
-#endif  /* OPENSSL_NO_PSK */
+# endif  /* OPENSSL_NO_PSK */
+# ifndef OPENSSL_NO_TLS1_2
+    /* Test with both TLSv1.3 and 1.2 versions */
+    ADD_ALL_TESTS(test_key_exchange, 14);
+# else
+    /* Test with only TLSv1.3 versions */
+    ADD_ALL_TESTS(test_key_exchange, 12);
+# endif
     ADD_ALL_TESTS(test_custom_exts, 5);
     ADD_TEST(test_stateless);
     ADD_TEST(test_pha_key_update);
@@ -5055,9 +8525,11 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_custom_exts, 3);
 #endif
     ADD_ALL_TESTS(test_serverinfo, 8);
-    ADD_ALL_TESTS(test_export_key_mat, 4);
+    ADD_ALL_TESTS(test_export_key_mat, 6);
 #ifndef OPENSSL_NO_TLS1_3
     ADD_ALL_TESTS(test_export_key_mat_early, 3);
+    ADD_TEST(test_key_update);
+    ADD_ALL_TESTS(test_key_update_in_write, 2);
 #endif
     ADD_ALL_TESTS(test_ssl_clear, 2);
     ADD_ALL_TESTS(test_max_fragment_len_ext, OSSL_NELEM(max_fragment_len_test));
@@ -5067,11 +8539,43 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_info_callback, 6);
     ADD_ALL_TESTS(test_ssl_pending, 2);
     ADD_ALL_TESTS(test_ssl_get_shared_ciphers, OSSL_NELEM(shared_ciphers_data));
-    ADD_ALL_TESTS(test_ticket_callbacks, 12);
+    ADD_ALL_TESTS(test_ticket_callbacks, 16);
+    ADD_ALL_TESTS(test_shutdown, 7);
+    ADD_ALL_TESTS(test_incorrect_shutdown, 2);
+    ADD_ALL_TESTS(test_cert_cb, 6);
+    ADD_ALL_TESTS(test_client_cert_cb, 2);
+    ADD_ALL_TESTS(test_ca_names, 3);
+#ifndef OPENSSL_NO_TLS1_2
+    ADD_ALL_TESTS(test_multiblock_write, OSSL_NELEM(multiblock_cipherlist_data));
+#endif
+    ADD_ALL_TESTS(test_servername, 10);
+#ifndef OPENSSL_NO_EC
+    ADD_ALL_TESTS(test_sigalgs_available, 6);
+#endif
+#ifndef OPENSSL_NO_TLS1_3
+    ADD_TEST(test_pluggable_group);
+#endif
+#ifndef OPENSSL_NO_TLS1_2
+    ADD_TEST(test_ssl_dup);
+#endif
     return 1;
+
+ err:
+    OPENSSL_free(cert);
+    OPENSSL_free(privkey);
+    OPENSSL_free(cert2);
+    OPENSSL_free(privkey2);
+    return 0;
 }
 
 void cleanup_tests(void)
 {
+    OPENSSL_free(cert);
+    OPENSSL_free(privkey);
+    OPENSSL_free(cert2);
+    OPENSSL_free(privkey2);
     bio_s_mempacket_test_free();
+    bio_s_always_retry_free();
+    OSSL_PROVIDER_unload(defctxnull);
+    OPENSSL_CTX_free(libctx);
 }

@@ -1,7 +1,7 @@
 /*
- * Copyright 2011-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2011-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -15,9 +15,11 @@
 
 #include <stdio.h>
 #include <openssl/objects.h>
-#include "ssl_locl.h"
+#include "ssl_local.h"
 
 #ifndef OPENSSL_NO_SRTP
+
+DEFINE_STACK_OF(SRTP_PROTECTION_PROFILE)
 
 static SRTP_PROTECTION_PROFILE srtp_known_profiles[] = {
     {

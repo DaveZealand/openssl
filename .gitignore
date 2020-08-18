@@ -2,7 +2,7 @@
 /.dir-locals.el
 
 # Top level excludes
-/Makefile.orig
+/Makefile
 /MINFO
 /TABLE
 /*.pc
@@ -13,11 +13,6 @@
 /tmp.*
 /configdata.pm
 
-# *all* Makefiles
-Makefile
-# ... except in demos
-!/demos/*/Makefile
-
 # Links under apps
 /apps/CA.pl
 /apps/tsget
@@ -26,10 +21,25 @@ Makefile
 
 # Auto generated headers
 /crypto/buildinf.h
-/apps/progs.h
-/crypto/include/internal/*_conf.h
-/openssl/include/opensslconf.h
-/util/domd
+/include/crypto/*_conf.h
+/include/openssl/configuration.h
+/include/openssl/opensslv.h
+/include/openssl/fipskey.h
+
+# Auto generated doc files
+doc/man1/openssl-*.pod
+
+# Auto generated der files
+providers/common/der/der_digests_gen.c
+providers/common/der/der_dsa_gen.c
+providers/common/der/der_ec_gen.c
+providers/common/der/der_rsa_gen.c
+providers/common/der/der_wrap_gen.c
+providers/common/include/prov/der_dsa.h
+providers/common/include/prov/der_ec.h
+providers/common/include/prov/der_rsa.h
+providers/common/include/prov/der_digests.h
+providers/common/include/prov/der_wrap.h
 
 # error code files
 /crypto/err/openssl.txt.old
@@ -59,10 +69,17 @@ Makefile
 /test/v3ext
 /test/versions
 /test/ossl_shim/ossl_shim
+/test/rsa_complex
+/test/confdump
+/test/bio_prefix_text
+/test/evp_extra_test2
 
 # Certain files that get created by tests on the fly
-/test/test-runs
+/test-runs
 /test/buildtest_*
+/test/provider_internal_test.cnf
+/test/fipsmodule.cnf
+/providers/fipsmodule.cnf
 
 # Fuzz stuff.
 # Anything without an extension is an executable on Unix, so we keep files
@@ -75,14 +92,16 @@ Makefile
 !/fuzz/*.*
 
 # Misc auto generated files
-/include/openssl/opensslconf.h
+/doc/man7/openssl_user_macros.pod
 /tools/c_rehash
 /tools/c_rehash.pl
 /util/shlib_wrap.sh
 /tags
 /TAGS
-/libcrypto.map
-/libssl.map
+*.map
+*.ld
+/apps/progs.c
+/apps/progs.h
 
 # Windows (legacy)
 /tmp32
@@ -95,7 +114,6 @@ Makefile
 /out32dll.dbg
 /inc32
 /MINFO
-/ms/.rnd
 /ms/bcb.mak
 /ms/libeay32.def
 /ms/nt.mak
@@ -128,6 +146,10 @@ Makefile
 /test/fips_shatest.c
 /test/fips_test_suite.c
 /test/shatest.c
+
+# Generated docs directories
+/doc/html
+/doc/man
 
 ##### Generic patterns
 # Auto generated assembly language source files
@@ -177,6 +199,7 @@ Makefile.save
 *.bak
 cscope.*
 *.d
+*.d.tmp
 pod2htmd.tmp
 
 # Windows manifest files

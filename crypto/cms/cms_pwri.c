@@ -1,7 +1,7 @@
 /*
- * Copyright 2009-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2009-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -15,8 +15,10 @@
 #include <openssl/cms.h>
 #include <openssl/rand.h>
 #include <openssl/aes.h>
-#include "cms_lcl.h"
-#include "internal/asn1_int.h"
+#include "cms_local.h"
+#include "crypto/asn1.h"
+
+DEFINE_STACK_OF(CMS_RecipientInfo)
 
 int CMS_RecipientInfo_set0_password(CMS_RecipientInfo *ri,
                                     unsigned char *pass, ossl_ssize_t passlen)
@@ -49,6 +51,7 @@ CMS_RecipientInfo *CMS_add0_recipient_password(CMS_ContentInfo *cms,
     X509_ALGOR *encalg = NULL;
     unsigned char iv[EVP_MAX_IV_LENGTH];
     int ivlen;
+    const CMS_CTX *cms_ctx = cms_get0_cmsctx(cms);
 
     env = cms_get0_enveloped(cms);
     if (!env)
@@ -89,7 +92,7 @@ CMS_RecipientInfo *CMS_add0_recipient_password(CMS_ContentInfo *cms,
     ivlen = EVP_CIPHER_CTX_iv_length(ctx);
 
     if (ivlen > 0) {
-        if (RAND_bytes(iv, ivlen) <= 0)
+        if (RAND_bytes_ex(cms_ctx->libctx, iv, ivlen) <= 0)
             goto err;
         if (EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, iv) <= 0) {
             CMSerr(CMS_F_CMS_ADD0_RECIPIENT_PASSWORD, ERR_R_EVP_LIB);
@@ -123,6 +126,7 @@ CMS_RecipientInfo *CMS_add0_recipient_password(CMS_ContentInfo *cms,
     ri->type = CMS_RECIPINFO_PASS;
 
     pwri = ri->d.pwri;
+    pwri->cms_ctx = cms_ctx;
     /* Since this is overwritten, free up empty structure already there */
     X509_ALGOR_free(pwri->keyEncryptionAlgorithm);
     pwri->keyEncryptionAlgorithm = X509_ALGOR_new();
@@ -146,7 +150,7 @@ CMS_RecipientInfo *CMS_add0_recipient_password(CMS_ContentInfo *cms,
 
     pwri->keyDerivationAlgorithm = PKCS5_pbkdf2_set(iter, NULL, 0, -1, -1);
 
-    if (!pwri->keyDerivationAlgorithm)
+    if (pwri->keyDerivationAlgorithm == NULL)
         goto err;
 
     CMS_RecipientInfo_set0_password(ri, pass, passlen);
@@ -230,7 +234,7 @@ static int kek_unwrap_key(unsigned char *out, size_t *outlen,
 
 static int kek_wrap_key(unsigned char *out, size_t *outlen,
                         const unsigned char *in, size_t inlen,
-                        EVP_CIPHER_CTX *ctx)
+                        EVP_CIPHER_CTX *ctx, const CMS_CTX *cms_ctx)
 {
     size_t blocklen = EVP_CIPHER_CTX_block_size(ctx);
     size_t olen;
@@ -258,7 +262,8 @@ static int kek_wrap_key(unsigned char *out, size_t *outlen,
         memcpy(out + 4, in, inlen);
         /* Add random padding to end */
         if (olen > inlen + 4
-            && RAND_bytes(out + 4 + inlen, olen - 4 - inlen) <= 0)
+            && RAND_bytes_ex(cms_ctx->libctx, out + 4 + inlen,
+                             olen - 4 - inlen) <= 0)
             return 0;
         /* Encrypt twice */
         if (!EVP_EncryptUpdate(ctx, out, &dummy, out, olen)
@@ -273,23 +278,25 @@ static int kek_wrap_key(unsigned char *out, size_t *outlen,
 
 /* Encrypt/Decrypt content key in PWRI recipient info */
 
-int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
-                                 int en_de)
+int cms_RecipientInfo_pwri_crypt(const CMS_ContentInfo *cms,
+                                 CMS_RecipientInfo *ri, int en_de)
 {
     CMS_EncryptedContentInfo *ec;
     CMS_PasswordRecipientInfo *pwri;
     int r = 0;
     X509_ALGOR *algtmp, *kekalg = NULL;
     EVP_CIPHER_CTX *kekctx = NULL;
-    const EVP_CIPHER *kekcipher;
+    const char *name;
+    EVP_CIPHER *kekcipher;
     unsigned char *key = NULL;
     size_t keylen;
+    const CMS_CTX *cms_ctx = cms_get0_cmsctx(cms);
 
     ec = cms->d.envelopedData->encryptedContentInfo;
 
     pwri = ri->d.pwri;
 
-    if (!pwri->pass) {
+    if (pwri->pass == NULL) {
         CMSerr(CMS_F_CMS_RECIPIENTINFO_PWRI_CRYPT, CMS_R_NO_PASSWORD);
         return 0;
     }
@@ -310,17 +317,18 @@ int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
         return 0;
     }
 
-    kekcipher = EVP_get_cipherbyobj(kekalg->algorithm);
+    name = OBJ_nid2sn(OBJ_obj2nid(kekalg->algorithm));
+    kekcipher = EVP_CIPHER_fetch(cms_ctx->libctx, name, cms_ctx->propq);
 
-    if (!kekcipher) {
+    if (kekcipher == NULL) {
         CMSerr(CMS_F_CMS_RECIPIENTINFO_PWRI_CRYPT, CMS_R_UNKNOWN_CIPHER);
-        return 0;
+        goto err;
     }
 
     kekctx = EVP_CIPHER_CTX_new();
     if (kekctx == NULL) {
         CMSerr(CMS_F_CMS_RECIPIENTINFO_PWRI_CRYPT, ERR_R_MALLOC_FAILURE);
-        return 0;
+        goto err;
     }
     /* Fixup cipher based on AlgorithmIdentifier to set IV etc */
     if (!EVP_CipherInit_ex(kekctx, kekcipher, NULL, NULL, NULL, en_de))
@@ -347,7 +355,7 @@ int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
 
     if (en_de) {
 
-        if (!kek_wrap_key(NULL, &keylen, ec->key, ec->keylen, kekctx))
+        if (!kek_wrap_key(NULL, &keylen, ec->key, ec->keylen, kekctx, cms_ctx))
             goto err;
 
         key = OPENSSL_malloc(keylen);
@@ -355,7 +363,7 @@ int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
         if (key == NULL)
             goto err;
 
-        if (!kek_wrap_key(key, &keylen, ec->key, ec->keylen, kekctx))
+        if (!kek_wrap_key(key, &keylen, ec->key, ec->keylen, kekctx, cms_ctx))
             goto err;
         pwri->encryptedKey->data = key;
         pwri->encryptedKey->length = keylen;
@@ -373,6 +381,7 @@ int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
             goto err;
         }
 
+        OPENSSL_clear_free(ec->key, ec->keylen);
         ec->key = key;
         ec->keylen = keylen;
 
@@ -381,7 +390,7 @@ int cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
     r = 1;
 
  err:
-
+    EVP_CIPHER_free(kekcipher);
     EVP_CIPHER_CTX_free(kekctx);
 
     if (!r)

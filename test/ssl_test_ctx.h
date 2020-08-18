@@ -1,14 +1,14 @@
 /*
- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
 
-#ifndef HEADER_SSL_TEST_CTX_H
-#define HEADER_SSL_TEST_CTX_H
+#ifndef OSSL_TEST_SSL_TEST_CTX_H
+#define OSSL_TEST_SSL_TEST_CTX_H
 
 #include <openssl/conf.h>
 #include <openssl/ssl.h>
@@ -108,8 +108,10 @@ typedef struct {
     char *reneg_ciphers;
     char *srp_user;
     char *srp_password;
-    /* Forced PHA */
-    int force_pha;
+    /* PHA enabled */
+    int enable_pha;
+    /* Do not send extms on renegotiation */
+    int no_extms_on_reneg;
 } SSL_TEST_CLIENT_CONF;
 
 typedef struct {
@@ -214,11 +216,17 @@ typedef struct {
     STACK_OF(X509_NAME) *expected_client_ca_names;
     /* Whether to use SCTP for the transport */
     int use_sctp;
+    /* Enable SSL_MODE_DTLS_SCTP_LABEL_LENGTH_BUG on client side */
+    int enable_client_sctp_label_bug;
+    /* Enable SSL_MODE_DTLS_SCTP_LABEL_LENGTH_BUG on server side */
+    int enable_server_sctp_label_bug;
     /* Whether to expect a session id from the server */
     ssl_session_id_t session_id_expected;
     char *expected_cipher;
     /* Expected Session Ticket Application Data */
     char *expected_session_ticket_app_data;
+
+    OPENSSL_CTX *libctx;
 } SSL_TEST_CTX;
 
 const char *ssl_test_result_name(ssl_test_result_t result);
@@ -240,10 +248,11 @@ const char *ssl_max_fragment_len_name(int MFL_mode);
  * Load the test case context from |conf|.
  * See test/README.ssltest.md for details on the conf file format.
  */
-SSL_TEST_CTX *SSL_TEST_CTX_create(const CONF *conf, const char *test_section);
+SSL_TEST_CTX *SSL_TEST_CTX_create(const CONF *conf, const char *test_section,
+                                  OPENSSL_CTX *libctx);
 
-SSL_TEST_CTX *SSL_TEST_CTX_new(void);
+SSL_TEST_CTX *SSL_TEST_CTX_new(OPENSSL_CTX *libctx);
 
 void SSL_TEST_CTX_free(SSL_TEST_CTX *ctx);
 
-#endif  /* HEADER_SSL_TEST_CTX_H */
+#endif  /* OSSL_TEST_SSL_TEST_CTX_H */

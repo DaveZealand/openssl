@@ -1,7 +1,7 @@
 /*
- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -114,7 +114,7 @@ static SSL_TEST_CTX_TEST_FIXTURE *set_up(const char *const test_case_name)
     if (!TEST_ptr(fixture = OPENSSL_zalloc(sizeof(*fixture))))
         return NULL;
     fixture->test_case_name = test_case_name;
-    if (!TEST_ptr(fixture->expected_ctx = SSL_TEST_CTX_new())) {
+    if (!TEST_ptr(fixture->expected_ctx = SSL_TEST_CTX_new(NULL))) {
         OPENSSL_free(fixture);
         return NULL;
     }
@@ -126,7 +126,8 @@ static int execute_test(SSL_TEST_CTX_TEST_FIXTURE *fixture)
     int success = 0;
     SSL_TEST_CTX *ctx;
 
-    if (!TEST_ptr(ctx = SSL_TEST_CTX_create(conf, fixture->test_section))
+    if (!TEST_ptr(ctx = SSL_TEST_CTX_create(conf, fixture->test_section,
+                                            fixture->expected_ctx->libctx))
             || !testctx_eq(ctx, fixture->expected_ctx))
         goto err;
 
@@ -232,7 +233,7 @@ static int test_bad_configuration(int idx)
     SSL_TEST_CTX *ctx;
 
     if (!TEST_ptr_null(ctx = SSL_TEST_CTX_create(conf,
-                                                 bad_configurations[idx]))) {
+                                                 bad_configurations[idx], NULL))) {
         SSL_TEST_CTX_free(ctx);
         return 0;
     }
@@ -240,15 +241,20 @@ static int test_bad_configuration(int idx)
     return 1;
 }
 
+OPT_TEST_DECLARE_USAGE("conf_file\n")
+
 int setup_tests(void)
 {
-    if (!TEST_ptr(conf = NCONF_new(NULL)))
-        return 0;
-    /* argument should point to test/ssl_test_ctx_test.conf */
-    if (!TEST_int_gt(NCONF_load(conf, test_get_argument(0), NULL), 0)) {
-        TEST_note("Missing file argument");
+    if (!test_skip_common_options()) {
+        TEST_error("Error parsing test options\n");
         return 0;
     }
+
+    if (!TEST_ptr(conf = NCONF_new(NULL)))
+        return 0;
+    /* argument should point to test/ssl_test_ctx_test.cnf */
+    if (!TEST_int_gt(NCONF_load(conf, test_get_argument(0), NULL), 0))
+        return 0;
 
     ADD_TEST(test_empty_configuration);
     ADD_TEST(test_good_configuration);

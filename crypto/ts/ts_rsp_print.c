@@ -1,7 +1,7 @@
 /*
- * Copyright 2006-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2006-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -13,7 +13,10 @@
 #include <openssl/bn.h>
 #include <openssl/x509v3.h>
 #include <openssl/ts.h>
-#include "ts_lcl.h"
+#include "ts_local.h"
+
+DEFINE_STACK_OF(ASN1_UTF8STRING)
+DEFINE_STACK_OF(CONF_VALUE)
 
 struct status_map_st {
     int bit;

@@ -1,7 +1,7 @@
 #! /usr/bin/env perl
 # Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
+# Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
 # in the file LICENSE in the source distribution or at
 # https://www.openssl.org/source/license.html
@@ -57,7 +57,10 @@ if (eval { require Win32::API; 1; }) {
 }
 $ENV{OPENSSL_WIN32_UTF8}=1;
 
-plan tests => 1;
+plan tests => 2;
+
+# Test different PKCS#12 formats
+ok(run(test(["pkcs12_format_test"])), "test pkcs12 formats");
 
 # just see that we can read shibboleth.pfx protected with $pass
 ok(run(app(["openssl", "pkcs12", "-noout",

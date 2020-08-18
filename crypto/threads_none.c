@@ -1,7 +1,7 @@
 /*
  * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -11,6 +11,11 @@
 #include "internal/cryptlib.h"
 
 #if !defined(OPENSSL_THREADS) || defined(CRYPTO_TDEBUG)
+
+# if defined(OPENSSL_SYS_UNIX)
+#  include <sys/types.h>
+#  include <unistd.h>
+# endif
 
 CRYPTO_RWLOCK *CRYPTO_THREAD_lock_new(void)
 {
@@ -128,21 +133,17 @@ int CRYPTO_atomic_add(int *val, int amount, int *ret, CRYPTO_RWLOCK *lock)
     return 1;
 }
 
-int CRYPTO_atomic_read(int *val, int *ret, CRYPTO_RWLOCK *lock)
-{
-    *ret = *val;
-    return 1;
-}
-
-int CRYPTO_atomic_write(int *val, int n, CRYPTO_RWLOCK *lock)
-{
-    *val = n;
-    return 1;
-}
-
 int openssl_init_fork_handlers(void)
 {
     return 0;
 }
 
+int openssl_get_fork_id(void)
+{
+# if defined(OPENSSL_SYS_UNIX)
+    return getpid();
+# else
+    return 0;
+# endif
+}
 #endif

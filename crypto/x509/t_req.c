@@ -1,7 +1,7 @@
 /*
- * Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -16,6 +16,8 @@
 #include <openssl/x509v3.h>
 #include <openssl/rsa.h>
 #include <openssl/dsa.h>
+
+DEFINE_STACK_OF(X509_EXTENSION)
 
 #ifndef OPENSSL_NO_STDIO
 int X509_REQ_print_fp(FILE *fp, X509_REQ *x)
@@ -127,6 +129,10 @@ int X509_REQ_print_ex(BIO *bp, X509_REQ *x, unsigned long nmflags,
                 if ((j = i2a_ASN1_OBJECT(bp, aobj)) > 0) {
                     ii = 0;
                     count = X509_ATTRIBUTE_count(a);
+                    if (count == 0) {
+                      X509err(X509_F_X509_REQ_PRINT_EX, X509_R_INVALID_ATTRIBUTES);
+                      return 0;
+                    }
  get_next:
                     at = X509_ATTRIBUTE_get0_type(a, ii);
                     type = at->type;

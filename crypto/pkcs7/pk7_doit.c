@@ -1,7 +1,7 @@
 /*
- * Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -14,6 +14,12 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/err.h>
+#include "pk7_local.h"
+
+DEFINE_STACK_OF(X509_ALGOR)
+DEFINE_STACK_OF(X509_ATTRIBUTE)
+DEFINE_STACK_OF(PKCS7_RECIP_INFO)
+DEFINE_STACK_OF(PKCS7_SIGNER_INFO)
 
 static int add_attribute(STACK_OF(X509_ATTRIBUTE) **sk, int nid, int atrtype,
                          void *value);
@@ -52,22 +58,27 @@ static ASN1_OCTET_STRING *PKCS7_get_octet_string(PKCS7 *p7)
     return NULL;
 }
 
-static int PKCS7_bio_add_digest(BIO **pbio, X509_ALGOR *alg)
+static int pkcs7_bio_add_digest(BIO **pbio, X509_ALGOR *alg,
+                                const PKCS7_CTX *ctx)
 {
     BIO *btmp;
-    const EVP_MD *md;
+    const char *name;
+    EVP_MD *fetched = NULL;
+
     if ((btmp = BIO_new(BIO_f_md())) == NULL) {
         PKCS7err(PKCS7_F_PKCS7_BIO_ADD_DIGEST, ERR_R_BIO_LIB);
         goto err;
     }
 
-    md = EVP_get_digestbyobj(alg->algorithm);
-    if (md == NULL) {
+    name = OBJ_nid2sn(OBJ_obj2nid(alg->algorithm));
+    fetched = EVP_MD_fetch(ctx->libctx, name, ctx->propq);
+    if (fetched == NULL) {
         PKCS7err(PKCS7_F_PKCS7_BIO_ADD_DIGEST, PKCS7_R_UNKNOWN_DIGEST_TYPE);
         goto err;
     }
 
-    BIO_set_md(btmp, md);
+    BIO_set_md(btmp, fetched);
+    EVP_MD_free(fetched);
     if (*pbio == NULL)
         *pbio = btmp;
     else if (!BIO_push(*pbio, btmp)) {
@@ -81,7 +92,6 @@ static int PKCS7_bio_add_digest(BIO **pbio, X509_ALGOR *alg)
  err:
     BIO_free(btmp);
     return 0;
-
 }
 
 static int pkcs7_encode_rinfo(PKCS7_RECIP_INFO *ri,
@@ -92,14 +102,14 @@ static int pkcs7_encode_rinfo(PKCS7_RECIP_INFO *ri,
     unsigned char *ek = NULL;
     int ret = 0;
     size_t eklen;
+    const PKCS7_CTX *ctx = ri->ctx;
 
     pkey = X509_get0_pubkey(ri->cert);
-
-    if (!pkey)
+    if (pkey == NULL)
         return 0;
 
-    pctx = EVP_PKEY_CTX_new(pkey, NULL);
-    if (!pctx)
+    pctx = EVP_PKEY_CTX_new_from_pkey(ctx->libctx, pkey, ctx->propq);
+    if (pctx == NULL)
         return 0;
 
     if (EVP_PKEY_encrypt_init(pctx) <= 0)
@@ -137,16 +147,17 @@ static int pkcs7_encode_rinfo(PKCS7_RECIP_INFO *ri,
 }
 
 static int pkcs7_decrypt_rinfo(unsigned char **pek, int *peklen,
-                               PKCS7_RECIP_INFO *ri, EVP_PKEY *pkey)
+                               PKCS7_RECIP_INFO *ri, EVP_PKEY *pkey,
+                               size_t fixlen)
 {
     EVP_PKEY_CTX *pctx = NULL;
     unsigned char *ek = NULL;
     size_t eklen;
-
     int ret = -1;
+    const PKCS7_CTX *ctx = ri->ctx;
 
-    pctx = EVP_PKEY_CTX_new(pkey, NULL);
-    if (!pctx)
+    pctx = EVP_PKEY_CTX_new_from_pkey(ctx->libctx, pkey, ctx->propq);
+    if (pctx == NULL)
         return -1;
 
     if (EVP_PKEY_decrypt_init(pctx) <= 0)
@@ -170,7 +181,9 @@ static int pkcs7_decrypt_rinfo(unsigned char **pek, int *peklen,
     }
 
     if (EVP_PKEY_decrypt(pctx, ek, &eklen,
-                         ri->enc_key->data, ri->enc_key->length) <= 0) {
+                         ri->enc_key->data, ri->enc_key->length) <= 0
+            || eklen == 0
+            || (fixlen != 0 && eklen != fixlen)) {
         ret = 0;
         PKCS7err(PKCS7_F_PKCS7_DECRYPT_RINFO, ERR_R_EVP_LIB);
         goto err;
@@ -195,17 +208,21 @@ BIO *PKCS7_dataInit(PKCS7 *p7, BIO *bio)
     int i;
     BIO *out = NULL, *btmp = NULL;
     X509_ALGOR *xa = NULL;
+    EVP_CIPHER *fetched_cipher = NULL;
     const EVP_CIPHER *evp_cipher = NULL;
     STACK_OF(X509_ALGOR) *md_sk = NULL;
     STACK_OF(PKCS7_RECIP_INFO) *rsk = NULL;
     X509_ALGOR *xalg = NULL;
     PKCS7_RECIP_INFO *ri = NULL;
     ASN1_OCTET_STRING *os = NULL;
+    const PKCS7_CTX *p7_ctx;
 
     if (p7 == NULL) {
         PKCS7err(PKCS7_F_PKCS7_DATAINIT, PKCS7_R_INVALID_NULL_POINTER);
         return NULL;
     }
+    p7_ctx = pkcs7_get0_ctx(p7);
+
     /*
      * The content field in the PKCS7 ContentInfo is optional, but that really
      * only applies to inner content (precisely, detached signatures).
@@ -260,10 +277,10 @@ BIO *PKCS7_dataInit(PKCS7 *p7, BIO *bio)
     }
 
     for (i = 0; i < sk_X509_ALGOR_num(md_sk); i++)
-        if (!PKCS7_bio_add_digest(&out, sk_X509_ALGOR_value(md_sk, i)))
+        if (!pkcs7_bio_add_digest(&out, sk_X509_ALGOR_value(md_sk, i), p7_ctx))
             goto err;
 
-    if (xa && !PKCS7_bio_add_digest(&out, xa))
+    if (xa && !pkcs7_bio_add_digest(&out, xa, p7_ctx))
         goto err;
 
     if (evp_cipher != NULL) {
@@ -281,10 +298,21 @@ BIO *PKCS7_dataInit(PKCS7 *p7, BIO *bio)
         ivlen = EVP_CIPHER_iv_length(evp_cipher);
         xalg->algorithm = OBJ_nid2obj(EVP_CIPHER_type(evp_cipher));
         if (ivlen > 0)
-            if (RAND_bytes(iv, ivlen) <= 0)
+            if (RAND_bytes_ex(p7_ctx->libctx, iv, ivlen) <= 0)
                 goto err;
-        if (EVP_CipherInit_ex(ctx, evp_cipher, NULL, NULL, NULL, 1) <= 0)
+
+        fetched_cipher = EVP_CIPHER_fetch(p7_ctx->libctx,
+                                          EVP_CIPHER_name(evp_cipher),
+                                          p7_ctx->propq);
+        if (fetched_cipher == NULL)
             goto err;
+
+        if (EVP_CipherInit_ex(ctx, fetched_cipher, NULL, NULL, NULL, 1) <= 0)
+            goto err;
+
+        EVP_CIPHER_free(fetched_cipher);
+        fetched_cipher = NULL;
+
         if (EVP_CIPHER_CTX_rand_key(ctx, key) <= 0)
             goto err;
         if (EVP_CipherInit_ex(ctx, NULL, NULL, key, iv, 1) <= 0)
@@ -336,6 +364,7 @@ BIO *PKCS7_dataInit(PKCS7 *p7, BIO *bio)
     return out;
 
  err:
+    EVP_CIPHER_free(fetched_cipher);
     BIO_free_all(out);
     BIO_free_all(btmp);
     return NULL;
@@ -348,19 +377,19 @@ static int pkcs7_cmp_ri(PKCS7_RECIP_INFO *ri, X509 *pcert)
                         X509_get_issuer_name(pcert));
     if (ret)
         return ret;
-    return ASN1_INTEGER_cmp(X509_get_serialNumber(pcert),
+    return ASN1_INTEGER_cmp(X509_get0_serialNumber(pcert),
                             ri->issuer_and_serial->serial);
 }
 
 /* int */
 BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
 {
-    int i, j;
+    int i, len;
     BIO *out = NULL, *btmp = NULL, *etmp = NULL, *bio = NULL;
     X509_ALGOR *xa;
     ASN1_OCTET_STRING *data_body = NULL;
-    const EVP_MD *evp_md;
-    const EVP_CIPHER *evp_cipher = NULL;
+    EVP_MD *evp_md = NULL;
+    EVP_CIPHER *evp_cipher = NULL;
     EVP_CIPHER_CTX *evp_ctx = NULL;
     X509_ALGOR *enc_alg = NULL;
     STACK_OF(X509_ALGOR) *md_sk = NULL;
@@ -368,11 +397,15 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
     PKCS7_RECIP_INFO *ri = NULL;
     unsigned char *ek = NULL, *tkey = NULL;
     int eklen = 0, tkeylen = 0;
+    const char *name;
+    const PKCS7_CTX *p7_ctx;
 
     if (p7 == NULL) {
         PKCS7err(PKCS7_F_PKCS7_DATADECODE, PKCS7_R_INVALID_NULL_POINTER);
         return NULL;
     }
+
+    p7_ctx = pkcs7_get0_ctx(p7);
 
     if (p7->d.ptr == NULL) {
         PKCS7err(PKCS7_F_PKCS7_DATADECODE, PKCS7_R_NO_CONTENT);
@@ -404,7 +437,9 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
         /* data_body is NULL if the optional EncryptedContent is missing. */
         data_body = p7->d.signed_and_enveloped->enc_data->enc_data;
         enc_alg = p7->d.signed_and_enveloped->enc_data->algorithm;
-        evp_cipher = EVP_get_cipherbyobj(enc_alg->algorithm);
+
+        name = OBJ_nid2sn(OBJ_obj2nid(enc_alg->algorithm));
+        evp_cipher = EVP_CIPHER_fetch(p7_ctx->libctx, name, p7_ctx->propq);
         if (evp_cipher == NULL) {
             PKCS7err(PKCS7_F_PKCS7_DATADECODE,
                      PKCS7_R_UNSUPPORTED_CIPHER_TYPE);
@@ -416,7 +451,8 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
         enc_alg = p7->d.enveloped->enc_data->algorithm;
         /* data_body is NULL if the optional EncryptedContent is missing. */
         data_body = p7->d.enveloped->enc_data->enc_data;
-        evp_cipher = EVP_get_cipherbyobj(enc_alg->algorithm);
+        name = OBJ_nid2sn(OBJ_obj2nid(enc_alg->algorithm));
+        evp_cipher = EVP_CIPHER_fetch(p7_ctx->libctx, name, p7_ctx->propq);
         if (evp_cipher == NULL) {
             PKCS7err(PKCS7_F_PKCS7_DATADECODE,
                      PKCS7_R_UNSUPPORTED_CIPHER_TYPE);
@@ -443,8 +479,8 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
                 goto err;
             }
 
-            j = OBJ_obj2nid(xa->algorithm);
-            evp_md = EVP_get_digestbynid(j);
+            name = OBJ_nid2sn(OBJ_obj2nid(xa->algorithm));
+            evp_md = EVP_MD_fetch(p7_ctx->libctx, name, p7_ctx->propq);
             if (evp_md == NULL) {
                 PKCS7err(PKCS7_F_PKCS7_DATADECODE,
                          PKCS7_R_UNKNOWN_DIGEST_TYPE);
@@ -452,6 +488,7 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
             }
 
             BIO_set_md(btmp, evp_md);
+            EVP_MD_free(evp_md);
             if (out == NULL)
                 out = btmp;
             else
@@ -498,14 +535,16 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
              */
             for (i = 0; i < sk_PKCS7_RECIP_INFO_num(rsk); i++) {
                 ri = sk_PKCS7_RECIP_INFO_value(rsk, i);
-
-                if (pkcs7_decrypt_rinfo(&ek, &eklen, ri, pkey) < 0)
+                ri->ctx = p7_ctx;
+                if (pkcs7_decrypt_rinfo(&ek, &eklen, ri, pkey,
+                        EVP_CIPHER_key_length(evp_cipher)) < 0)
                     goto err;
                 ERR_clear_error();
             }
         } else {
+            ri->ctx = p7_ctx;
             /* Only exit on fatal errors, not decrypt failure */
-            if (pkcs7_decrypt_rinfo(&ek, &eklen, ri, pkey) < 0)
+            if (pkcs7_decrypt_rinfo(&ek, &eklen, ri, pkey, 0) < 0)
                 goto err;
             ERR_clear_error();
         }
@@ -517,7 +556,10 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
         if (EVP_CIPHER_asn1_to_param(evp_ctx, enc_alg->parameter) < 0)
             goto err;
         /* Generate random key as MMA defence */
-        tkeylen = EVP_CIPHER_CTX_key_length(evp_ctx);
+        len = EVP_CIPHER_CTX_key_length(evp_ctx);
+        if (len <= 0)
+            goto err;
+        tkeylen = (size_t)len;
         tkey = OPENSSL_malloc(tkeylen);
         if (tkey == NULL)
             goto err;
@@ -575,9 +617,11 @@ BIO *PKCS7_dataDecode(PKCS7 *p7, EVP_PKEY *pkey, BIO *in_bio, X509 *pcert)
     }
     BIO_push(out, bio);
     bio = NULL;
+    EVP_CIPHER_free(evp_cipher);
     return out;
 
  err:
+    EVP_CIPHER_free(evp_cipher);
     OPENSSL_clear_free(ek, eklen);
     OPENSSL_clear_free(tkey, tkeylen);
     BIO_free_all(out);
@@ -648,11 +692,14 @@ int PKCS7_dataFinal(PKCS7 *p7, BIO *bio)
     STACK_OF(X509_ATTRIBUTE) *sk;
     STACK_OF(PKCS7_SIGNER_INFO) *si_sk = NULL;
     ASN1_OCTET_STRING *os = NULL;
+    const PKCS7_CTX *p7_ctx;
 
     if (p7 == NULL) {
         PKCS7err(PKCS7_F_PKCS7_DATAFINAL, PKCS7_R_INVALID_NULL_POINTER);
         return 0;
     }
+
+    p7_ctx = pkcs7_get0_ctx(p7);
 
     if (p7->d.ptr == NULL) {
         PKCS7err(PKCS7_F_PKCS7_DATAFINAL, PKCS7_R_NO_CONTENT);
@@ -761,7 +808,8 @@ int PKCS7_dataFinal(PKCS7 *p7, BIO *bio)
                 if (abuf == NULL)
                     goto err;
 
-                if (!EVP_SignFinal(ctx_tmp, abuf, &abuflen, si->pkey)) {
+                if (!EVP_SignFinal_with_libctx(ctx_tmp, abuf, &abuflen, si->pkey,
+                                               p7_ctx->libctx, p7_ctx->propq)) {
                     OPENSSL_free(abuf);
                     PKCS7err(PKCS7_F_PKCS7_DATAFINAL, ERR_R_EVP_LIB);
                     goto err;
@@ -820,6 +868,7 @@ int PKCS7_SIGNER_INFO_sign(PKCS7_SIGNER_INFO *si)
     int alen;
     size_t siglen;
     const EVP_MD *md = NULL;
+    const PKCS7_CTX *ctx = si->ctx;
 
     md = EVP_get_digestbyobj(si->digest_alg->algorithm);
     if (md == NULL)
@@ -827,18 +876,38 @@ int PKCS7_SIGNER_INFO_sign(PKCS7_SIGNER_INFO *si)
 
     mctx = EVP_MD_CTX_new();
     if (mctx == NULL) {
-        PKCS7err(PKCS7_F_PKCS7_SIGNER_INFO_SIGN, ERR_R_MALLOC_FAILURE);
+        PKCS7err(0, ERR_R_MALLOC_FAILURE);
         goto err;
     }
 
-    if (EVP_DigestSignInit(mctx, &pctx, md, NULL, si->pkey) <= 0)
+    if (EVP_DigestSignInit_with_libctx(mctx, &pctx,
+                                       EVP_MD_name(md), ctx->libctx, ctx->propq,
+                                       si->pkey) <= 0)
         goto err;
 
+    /*
+     * TODO(3.0): This causes problems when providers are in use, so disabled
+     * for now. Can we get rid of this completely? AFAICT this ctrl has never
+     * been used since it was first put in. All internal implementations just
+     * return 1 and ignore this ctrl and have always done so by the looks of
+     * things. To fix this we could convert this ctrl into a param, which would
+     * require us to send all the signer info data as a set of params...but that
+     * is non-trivial and since this isn't used by anything it may be better
+     * just to remove it. The original commit that added it had this
+     * justification in CHANGES:
+     *
+     * "During PKCS7 signing pass the PKCS7 SignerInfo structure to the
+     *  EVP_PKEY_METHOD before and after signing via the
+     *  EVP_PKEY_CTRL_PKCS7_SIGN ctrl. It can then customise the structure
+     *  before and/or after signing if necessary."
+     */
+#if 0
     if (EVP_PKEY_CTX_ctrl(pctx, -1, EVP_PKEY_OP_SIGN,
                           EVP_PKEY_CTRL_PKCS7_SIGN, 0, si) <= 0) {
-        PKCS7err(PKCS7_F_PKCS7_SIGNER_INFO_SIGN, PKCS7_R_CTRL_ERROR);
+        PKCS7err(0, PKCS7_R_CTRL_ERROR);
         goto err;
     }
+#endif
 
     alen = ASN1_item_i2d((ASN1_VALUE *)si->auth_attr, &abuf,
                          ASN1_ITEM_rptr(PKCS7_ATTR_SIGN));
@@ -856,11 +925,29 @@ int PKCS7_SIGNER_INFO_sign(PKCS7_SIGNER_INFO *si)
     if (EVP_DigestSignFinal(mctx, abuf, &siglen) <= 0)
         goto err;
 
+    /*
+     * TODO(3.0): This causes problems when providers are in use, so disabled
+     * for now. Can we get rid of this completely? AFAICT this ctrl has never
+     * been used since it was first put in. All internal implementations just
+     * return 1 and ignore this ctrl and have always done so by the looks of
+     * things. To fix this we could convert this ctrl into a param, which would
+     * require us to send all the signer info data as a set of params...but that
+     * is non-trivial and since this isn't used by anything it may be better
+     * just to remove it. The original commit that added it had this
+     * justification in CHANGES:
+     *
+     * "During PKCS7 signing pass the PKCS7 SignerInfo structure to the
+     *  EVP_PKEY_METHOD before and after signing via the
+     *  EVP_PKEY_CTRL_PKCS7_SIGN ctrl. It can then customise the structure
+     *  before and/or after signing if necessary."
+     */
+#if 0
     if (EVP_PKEY_CTX_ctrl(pctx, -1, EVP_PKEY_OP_SIGN,
                           EVP_PKEY_CTRL_PKCS7_SIGN, 1, si) <= 0) {
-        PKCS7err(PKCS7_F_PKCS7_SIGNER_INFO_SIGN, PKCS7_R_CTRL_ERROR);
+        PKCS7err(0, PKCS7_R_CTRL_ERROR);
         goto err;
     }
+#endif
 
     EVP_MD_CTX_free(mctx);
 
@@ -872,7 +959,6 @@ int PKCS7_SIGNER_INFO_sign(PKCS7_SIGNER_INFO *si)
     OPENSSL_free(abuf);
     EVP_MD_CTX_free(mctx);
     return 0;
-
 }
 
 int PKCS7_dataVerify(X509_STORE *cert_store, X509_STORE_CTX *ctx, BIO *bio,
@@ -937,11 +1023,13 @@ int PKCS7_signatureVerify(BIO *bio, PKCS7 *p7, PKCS7_SIGNER_INFO *si,
 {
     ASN1_OCTET_STRING *os;
     EVP_MD_CTX *mdc_tmp, *mdc;
+    EVP_MD *fetched_md = NULL;
     int ret = 0, i;
     int md_type;
     STACK_OF(X509_ATTRIBUTE) *sk;
     BIO *btmp;
     EVP_PKEY *pkey;
+    const PKCS7_CTX *ctx = pkcs7_get0_ctx(p7);
 
     mdc_tmp = EVP_MD_CTX_new();
     if (mdc_tmp == NULL) {
@@ -1009,7 +1097,8 @@ int PKCS7_signatureVerify(BIO *bio, PKCS7 *p7, PKCS7_SIGNER_INFO *si,
             goto err;
         }
 
-        if (!EVP_VerifyInit_ex(mdc_tmp, EVP_get_digestbynid(md_type), NULL))
+        fetched_md = EVP_MD_fetch(ctx->libctx, OBJ_nid2sn(md_type), ctx->propq);
+        if (fetched_md == NULL || !EVP_VerifyInit_ex(mdc_tmp, fetched_md, NULL))
             goto err;
 
         alen = ASN1_item_i2d((ASN1_VALUE *)sk, &abuf,
@@ -1027,12 +1116,13 @@ int PKCS7_signatureVerify(BIO *bio, PKCS7 *p7, PKCS7_SIGNER_INFO *si,
 
     os = si->enc_digest;
     pkey = X509_get0_pubkey(x509);
-    if (!pkey) {
+    if (pkey == NULL) {
         ret = -1;
         goto err;
     }
 
-    i = EVP_VerifyFinal(mdc_tmp, os->data, os->length, pkey);
+    i = EVP_VerifyFinal_with_libctx(mdc_tmp, os->data, os->length, pkey,
+                                    ctx->libctx, ctx->propq);
     if (i <= 0) {
         PKCS7err(PKCS7_F_PKCS7_SIGNATUREVERIFY, PKCS7_R_SIGNATURE_FAILURE);
         ret = -1;
@@ -1041,6 +1131,7 @@ int PKCS7_signatureVerify(BIO *bio, PKCS7 *p7, PKCS7_SIGNER_INFO *si,
     ret = 1;
  err:
     EVP_MD_CTX_free(mdc_tmp);
+    EVP_MD_free(fetched_md);
     return ret;
 }
 

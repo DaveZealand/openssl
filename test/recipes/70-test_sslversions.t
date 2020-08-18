@@ -1,7 +1,7 @@
 #! /usr/bin/env perl
-# Copyright 2015-2018 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2015-2020 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
+# Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
 # in the file LICENSE in the source distribution or at
 # https://www.openssl.org/source/license.html
@@ -18,7 +18,8 @@ use constant {
     NO_EXTENSION => 3,
     EMPTY_EXTENSION => 4,
     TLS1_1_AND_1_0_ONLY => 5,
-    WITH_TLS1_4 => 6
+    WITH_TLS1_4 => 6,
+    BAD_LEGACY_VERSION => 7
 };
 
 my $testtype;
@@ -48,14 +49,14 @@ my $proxy = TLSProxy::Proxy->new(
 );
 
 #We're just testing various negative and unusual scenarios here. ssltest with
-#02-protocol-version.conf should check all the various combinations of normal
+#02-protocol-version.cnf should check all the various combinations of normal
 #version neg
 
 #Test 1: An empty supported_versions extension should not succeed
 $testtype = EMPTY_EXTENSION;
 $proxy->filter(\&modify_supported_versions_filter);
 $proxy->start() or plan skip_all => "Unable to start up Proxy for tests";
-plan tests => 7;
+plan tests => 8;
 ok(TLSProxy::Message->fail(), "Empty supported versions");
 
 #Test 2: supported_versions extension with no recognised versions should not
@@ -94,6 +95,8 @@ ok(TLSProxy::Message->success()
 #Test 6: no TLSv1.3 or TLSv1.2 version in supported versions extension, but
 #TLSv1.1 and TLSv1.0 are present. Should just use TLSv1.1 and succeed
 $proxy->clear();
+$proxy->clientflags("-cipher DEFAULT:\@SECLEVEL=0");
+$proxy->ciphers("AES128-SHA:\@SECLEVEL=0");
 $testtype = TLS1_1_AND_1_0_ONLY;
 $proxy->start();
 $record = pop @{$proxy->record_list};
@@ -110,6 +113,12 @@ ok(TLSProxy::Message->success()
    && $record->version() == TLSProxy::Record::VERS_TLS_1_2
    && TLSProxy::Proxy->is_tls13(),
    "TLS1.4 in supported versions extension");
+
+#Test 8: Set the legacy version to SSLv3 with supported versions. Should fail
+$proxy->clear();
+$testtype = BAD_LEGACY_VERSION;
+$proxy->start();
+ok(TLSProxy::Message->fail(), "Legacy version is SSLv3 with supported versions");
 
 sub modify_supported_versions_filter
 {
@@ -138,8 +147,7 @@ sub modify_supported_versions_filter
                 $ext = pack "C5",
                     0x04, # Length
                     0x03, 0x03, #TLSv1.2
-                    #TODO(TLS1.3): Fix before release
-                    0x7f, 0x1c; #TLSv1.3 (draft 28)
+                    0x03, 0x04; #TLSv1.3
             } elsif ($testtype == UNRECOGNISED_VERSIONS) {
                 $ext = pack "C5",
                     0x04, # Length
@@ -153,8 +161,8 @@ sub modify_supported_versions_filter
             } elsif ($testtype == WITH_TLS1_4) {
                     $ext = pack "C5",
                         0x04, # Length
-                        #TODO(TLS1.3): Fix before release
-                        0x7f, 0x1c; #TLSv1.3 (draft 28)
+                        0x03, 0x05, #TLSv1.4
+                        0x03, 0x04; #TLSv1.3
             }
             if ($testtype == REVERSE_ORDER_VERSIONS
                     || $testtype == UNRECOGNISED_VERSIONS
@@ -165,14 +173,15 @@ sub modify_supported_versions_filter
             } elsif ($testtype == EMPTY_EXTENSION) {
                 $message->set_extension(
                     TLSProxy::Message::EXT_SUPPORTED_VERSIONS, "");
-            } else {
+            } elsif ($testtype == NO_EXTENSION) {
                 $message->delete_extension(
                     TLSProxy::Message::EXT_SUPPORTED_VERSIONS);
+            } else {
+                # BAD_LEGACY_VERSION
+                $message->client_version(TLSProxy::Record::VERS_SSL_3_0);
             }
 
             $message->repack();
         }
     }
 }
-
-

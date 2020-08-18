@@ -1,7 +1,7 @@
 /*
  * Copyright 2014-2018 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -10,7 +10,7 @@
 #include <string.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
-#include "modes_lcl.h"
+#include "crypto/modes.h"
 
 #ifndef OPENSSL_NO_OCB
 
@@ -42,22 +42,13 @@ static u32 ocb_ntz(u64 n)
 static void ocb_block_lshift(const unsigned char *in, size_t shift,
                              unsigned char *out)
 {
-    unsigned char shift_mask;
     int i;
-    unsigned char mask[15];
+    unsigned char carry = 0, carry_next;
 
-    shift_mask = 0xff;
-    shift_mask <<= (8 - shift);
     for (i = 15; i >= 0; i--) {
-        if (i > 0) {
-            mask[i - 1] = in[i] & shift_mask;
-            mask[i - 1] >>= 8 - shift;
-        }
-        out[i] = in[i] << shift;
-
-        if (i != 15) {
-            out[i] ^= mask[i];
-        }
+        carry_next = in[i] >> (8 - shift);
+        out[i] = (in[i] << shift) | carry;
+        carry = carry_next;
     }
 }
 
@@ -74,7 +65,7 @@ static void ocb_double(OCB_BLOCK *in, OCB_BLOCK *out)
      */
     mask = in->c[0] & 0x80;
     mask >>= 7;
-    mask *= 135;
+    mask = (0 - mask) & 0x87;
 
     ocb_block_lshift(in->c, 1, out->c);
 
@@ -119,8 +110,7 @@ static OCB_BLOCK *ocb_lookup_l(OCB128_CONTEXT *ctx, size_t idx)
          * the index.
          */
         ctx->max_l_index += (idx - ctx->max_l_index + 4) & ~3;
-        tmp_ptr =
-            OPENSSL_realloc(ctx->l, ctx->max_l_index * sizeof(OCB_BLOCK));
+        tmp_ptr = OPENSSL_realloc(ctx->l, ctx->max_l_index * sizeof(OCB_BLOCK));
         if (tmp_ptr == NULL) /* prevent ctx->l from being clobbered */
             return NULL;
         ctx->l = tmp_ptr;

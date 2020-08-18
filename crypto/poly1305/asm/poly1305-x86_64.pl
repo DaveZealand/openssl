@@ -1,7 +1,7 @@
 #! /usr/bin/env perl
-# Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
+# Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
 # in the file LICENSE in the source distribution or at
 # https://www.openssl.org/source/license.html
@@ -63,9 +63,10 @@
 # (***)	strangely enough performance seems to vary from core to core,
 #	listed result is best case;
 
-$flavour = shift;
-$output  = shift;
-if ($flavour =~ /\./) { $output = $flavour; undef $flavour; }
+# $output is the last argument if it looks like a file (it has an extension)
+# $flavour is the first argument if it doesn't look like a file
+$output = $#ARGV >= 0 && $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
+$flavour = $#ARGV >= 0 && $ARGV[0] !~ m|\.| ? shift : undef;
 
 $win64=0; $win64=1 if ($flavour =~ /[nm]asm|mingw64/ || $output =~ /\.asm$/);
 
@@ -90,11 +91,12 @@ if (!$avx && $win64 && ($flavour =~ /masm/ || $ENV{ASM} =~ /ml64/) &&
 	$avx = ($1>=10) + ($1>=12);
 }
 
-if (!$avx && `$ENV{CC} -v 2>&1` =~ /((?:^clang|LLVM) version|.*based on LLVM) ([3-9]\.[0-9]+)/) {
+if (!$avx && `$ENV{CC} -v 2>&1` =~ /((?:^clang|LLVM) version|.*based on LLVM) ([0-9]+\.[0-9]+)/) {
 	$avx = ($2>=3.0) + ($2>3.0);
 }
 
-open OUT,"| \"$^X\" \"$xlate\" $flavour \"$output\"";
+open OUT,"| \"$^X\" \"$xlate\" $flavour \"$output\""
+    or die "can't call $xlate: $!";
 *STDOUT=*OUT;
 
 my ($ctx,$inp,$len,$padbit)=("%rdi","%rsi","%rdx","%rcx");
@@ -168,6 +170,7 @@ $code.=<<___;
 .type	poly1305_init,\@function,3
 .align	32
 poly1305_init:
+.cfi_startproc
 	xor	%rax,%rax
 	mov	%rax,0($ctx)		# initialize hash value
 	mov	%rax,8($ctx)
@@ -219,6 +222,7 @@ $code.=<<___;
 	mov	\$1,%eax
 .Lno_key:
 	ret
+.cfi_endproc
 .size	poly1305_init,.-poly1305_init
 
 .type	poly1305_blocks,\@function,4
@@ -298,6 +302,7 @@ $code.=<<___;
 .type	poly1305_emit,\@function,3
 .align	32
 poly1305_emit:
+.cfi_startproc
 .Lemit:
 	mov	0($ctx),%r8	# load hash value
 	mov	8($ctx),%r9
@@ -318,6 +323,7 @@ poly1305_emit:
 	mov	%rcx,8($mac)
 
 	ret
+.cfi_endproc
 .size	poly1305_emit,.-poly1305_emit
 ___
 if ($avx) {
@@ -342,15 +348,18 @@ $code.=<<___;
 .type	__poly1305_block,\@abi-omnipotent
 .align	32
 __poly1305_block:
+.cfi_startproc
 ___
 	&poly1305_iteration();
 $code.=<<___;
 	ret
+.cfi_endproc
 .size	__poly1305_block,.-__poly1305_block
 
 .type	__poly1305_init_avx,\@abi-omnipotent
 .align	32
 __poly1305_init_avx:
+.cfi_startproc
 	mov	$r0,$h0
 	mov	$r1,$h1
 	xor	$h2,$h2
@@ -508,6 +517,7 @@ __poly1305_init_avx:
 
 	lea	-48-64($ctx),$ctx	# size [de-]optimization
 	ret
+.cfi_endproc
 .size	__poly1305_init_avx,.-__poly1305_init_avx
 
 .type	poly1305_blocks_avx,\@function,4
@@ -1373,6 +1383,7 @@ $code.=<<___;
 .type	poly1305_emit_avx,\@function,3
 .align	32
 poly1305_emit_avx:
+.cfi_startproc
 	cmpl	\$0,20($ctx)	# is_base2_26?
 	je	.Lemit
 
@@ -1423,6 +1434,7 @@ poly1305_emit_avx:
 	mov	%rcx,8($mac)
 
 	ret
+.cfi_endproc
 .size	poly1305_emit_avx,.-poly1305_emit_avx
 ___
 
@@ -2741,6 +2753,7 @@ $code.=<<___;
 .type	poly1305_init_base2_44,\@function,3
 .align	32
 poly1305_init_base2_44:
+.cfi_startproc
 	xor	%rax,%rax
 	mov	%rax,0($ctx)		# initialize hash value
 	mov	%rax,8($ctx)
@@ -2782,6 +2795,7 @@ ___
 $code.=<<___;
 	mov	\$1,%eax
 	ret
+.cfi_endproc
 .size	poly1305_init_base2_44,.-poly1305_init_base2_44
 ___
 {
@@ -2793,6 +2807,8 @@ $code.=<<___;
 .type	poly1305_blocks_vpmadd52,\@function,4
 .align	32
 poly1305_blocks_vpmadd52:
+.cfi_startproc
+	endbranch
 	shr	\$4,$len
 	jz	.Lno_data_vpmadd52		# too short
 
@@ -2899,6 +2915,7 @@ poly1305_blocks_vpmadd52:
 
 .Lno_data_vpmadd52:
 	ret
+.cfi_endproc
 .size	poly1305_blocks_vpmadd52,.-poly1305_blocks_vpmadd52
 ___
 }
@@ -2916,6 +2933,7 @@ $code.=<<___;
 .type	poly1305_blocks_vpmadd52_4x,\@function,4
 .align	32
 poly1305_blocks_vpmadd52_4x:
+.cfi_startproc
 	shr	\$4,$len
 	jz	.Lno_data_vpmadd52_4x		# too short
 
@@ -3340,6 +3358,7 @@ poly1305_blocks_vpmadd52_4x:
 
 .Lno_data_vpmadd52_4x:
 	ret
+.cfi_endproc
 .size	poly1305_blocks_vpmadd52_4x,.-poly1305_blocks_vpmadd52_4x
 ___
 }
@@ -3358,6 +3377,7 @@ $code.=<<___;
 .type	poly1305_blocks_vpmadd52_8x,\@function,4
 .align	32
 poly1305_blocks_vpmadd52_8x:
+.cfi_startproc
 	shr	\$4,$len
 	jz	.Lno_data_vpmadd52_8x		# too short
 
@@ -3713,6 +3733,7 @@ $code.=<<___;
 
 .Lno_data_vpmadd52_8x:
 	ret
+.cfi_endproc
 .size	poly1305_blocks_vpmadd52_8x,.-poly1305_blocks_vpmadd52_8x
 ___
 }
@@ -3720,6 +3741,8 @@ $code.=<<___;
 .type	poly1305_emit_base2_44,\@function,3
 .align	32
 poly1305_emit_base2_44:
+.cfi_startproc
+	endbranch
 	mov	0($ctx),%r8	# load hash value
 	mov	8($ctx),%r9
 	mov	16($ctx),%r10
@@ -3750,6 +3773,7 @@ poly1305_emit_base2_44:
 	mov	%rcx,8($mac)
 
 	ret
+.cfi_endproc
 .size	poly1305_emit_base2_44,.-poly1305_emit_base2_44
 ___
 }	}	}
@@ -3787,11 +3811,118 @@ $code.=<<___;
 .quad	0x3ffffffffff,0x3ffffffffff,0x3ffffffffff,0x3ffffffffff
 ___
 }
-
 $code.=<<___;
 .asciz	"Poly1305 for x86_64, CRYPTOGAMS by <appro\@openssl.org>"
 .align	16
 ___
+
+{	# chacha20-poly1305 helpers
+my ($out,$inp,$otp,$len)=$win64 ? ("%rcx","%rdx","%r8", "%r9") :  # Win64 order
+                                  ("%rdi","%rsi","%rdx","%rcx");  # Unix order
+$code.=<<___;
+.globl	xor128_encrypt_n_pad
+.type	xor128_encrypt_n_pad,\@abi-omnipotent
+.align	16
+xor128_encrypt_n_pad:
+.cfi_startproc
+	sub	$otp,$inp
+	sub	$otp,$out
+	mov	$len,%r10		# put len aside
+	shr	\$4,$len		# len / 16
+	jz	.Ltail_enc
+	nop
+.Loop_enc_xmm:
+	movdqu	($inp,$otp),%xmm0
+	pxor	($otp),%xmm0
+	movdqu	%xmm0,($out,$otp)
+	movdqa	%xmm0,($otp)
+	lea	16($otp),$otp
+	dec	$len
+	jnz	.Loop_enc_xmm
+
+	and	\$15,%r10		# len % 16
+	jz	.Ldone_enc
+
+.Ltail_enc:
+	mov	\$16,$len
+	sub	%r10,$len
+	xor	%eax,%eax
+.Loop_enc_byte:
+	mov	($inp,$otp),%al
+	xor	($otp),%al
+	mov	%al,($out,$otp)
+	mov	%al,($otp)
+	lea	1($otp),$otp
+	dec	%r10
+	jnz	.Loop_enc_byte
+
+	xor	%eax,%eax
+.Loop_enc_pad:
+	mov	%al,($otp)
+	lea	1($otp),$otp
+	dec	$len
+	jnz	.Loop_enc_pad
+
+.Ldone_enc:
+	mov	$otp,%rax
+	ret
+.cfi_endproc
+.size	xor128_encrypt_n_pad,.-xor128_encrypt_n_pad
+
+.globl	xor128_decrypt_n_pad
+.type	xor128_decrypt_n_pad,\@abi-omnipotent
+.align	16
+xor128_decrypt_n_pad:
+.cfi_startproc
+	sub	$otp,$inp
+	sub	$otp,$out
+	mov	$len,%r10		# put len aside
+	shr	\$4,$len		# len / 16
+	jz	.Ltail_dec
+	nop
+.Loop_dec_xmm:
+	movdqu	($inp,$otp),%xmm0
+	movdqa	($otp),%xmm1
+	pxor	%xmm0,%xmm1
+	movdqu	%xmm1,($out,$otp)
+	movdqa	%xmm0,($otp)
+	lea	16($otp),$otp
+	dec	$len
+	jnz	.Loop_dec_xmm
+
+	pxor	%xmm1,%xmm1
+	and	\$15,%r10		# len % 16
+	jz	.Ldone_dec
+
+.Ltail_dec:
+	mov	\$16,$len
+	sub	%r10,$len
+	xor	%eax,%eax
+	xor	%r11,%r11
+.Loop_dec_byte:
+	mov	($inp,$otp),%r11b
+	mov	($otp),%al
+	xor	%r11b,%al
+	mov	%al,($out,$otp)
+	mov	%r11b,($otp)
+	lea	1($otp),$otp
+	dec	%r10
+	jnz	.Loop_dec_byte
+
+	xor	%eax,%eax
+.Loop_dec_pad:
+	mov	%al,($otp)
+	lea	1($otp),$otp
+	dec	$len
+	jnz	.Loop_dec_pad
+
+.Ldone_dec:
+	mov	$otp,%rax
+	ret
+.cfi_endproc
+.size	xor128_decrypt_n_pad,.-xor128_decrypt_n_pad
+___
+}
 
 # EXCEPTION_DISPOSITION handler (EXCEPTION_RECORD *rec,ULONG64 frame,
 #		CONTEXT *context,DISPATCHER_CONTEXT *disp)
@@ -4053,4 +4184,4 @@ foreach (split('\n',$code)) {
 
 	print $_,"\n";
 }
-close STDOUT;
+close STDOUT or die "error closing STDOUT: $!";

@@ -1,14 +1,17 @@
 /*
- * Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
 
+/* We need to use some engine deprecated APIs */
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include <stdio.h>
-#include "internal/ctype.h"
+#include "crypto/ctype.h"
 #include <string.h>
 #include "internal/cryptlib.h"
 #include <openssl/buffer.h>
@@ -18,7 +21,7 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
-#include "internal/asn1_int.h"
+#include "crypto/asn1.h"
 #include <openssl/des.h>
 #include <openssl/engine.h>
 
@@ -80,7 +83,7 @@ void PEM_proc_type(char *buf, int type)
     BIO_snprintf(p, PEM_BUFSIZE - (size_t)(p - buf), "Proc-Type: 4,%s\n", str);
 }
 
-void PEM_dek_info(char *buf, const char *type, int len, char *str)
+void PEM_dek_info(char *buf, const char *type, int len, const char *str)
 {
     long i;
     char *p = buf + strlen(buf);
@@ -288,8 +291,9 @@ int PEM_bytes_read_bio_secmem(unsigned char **pdata, long *plen, char **pnm,
 
 #ifndef OPENSSL_NO_STDIO
 int PEM_ASN1_write(i2d_of_void *i2d, const char *name, FILE *fp,
-                   void *x, const EVP_CIPHER *enc, unsigned char *kstr,
-                   int klen, pem_password_cb *callback, void *u)
+                   const void *x, const EVP_CIPHER *enc,
+                   const unsigned char *kstr, int klen,
+                   pem_password_cb *callback, void *u)
 {
     BIO *b;
     int ret;
@@ -306,8 +310,9 @@ int PEM_ASN1_write(i2d_of_void *i2d, const char *name, FILE *fp,
 #endif
 
 int PEM_ASN1_write_bio(i2d_of_void *i2d, const char *name, BIO *bp,
-                       void *x, const EVP_CIPHER *enc, unsigned char *kstr,
-                       int klen, pem_password_cb *callback, void *u)
+                       const void *x, const EVP_CIPHER *enc,
+                       const unsigned char *kstr, int klen,
+                       pem_password_cb *callback, void *u)
 {
     EVP_CIPHER_CTX *ctx = NULL;
     int dsize = 0, i = 0, j = 0, ret = 0;
@@ -332,7 +337,7 @@ int PEM_ASN1_write_bio(i2d_of_void *i2d, const char *name, BIO *bp,
         }
     }
 
-    if ((dsize = i2d(x, NULL)) < 0) {
+    if ((dsize = i2d(x, NULL)) <= 0) {
         PEMerr(PEM_F_PEM_ASN1_WRITE_BIO, ERR_R_ASN1_LIB);
         dsize = 0;
         goto err;
@@ -488,6 +493,7 @@ int PEM_get_EVP_CIPHER_INFO(char *header, EVP_CIPHER_INFO *cipher)
     char *dekinfostart, c;
 
     cipher->cipher = NULL;
+    memset(cipher->iv, 0, sizeof(cipher->iv));
     if ((header == NULL) || (*header == '\0') || (*header == '\n'))
         return 1;
 
@@ -679,9 +685,20 @@ int PEM_read(FILE *fp, char **name, char **header, unsigned char **data,
 #endif
 
 /* Some helpers for PEM_read_bio_ex(). */
-static int sanitize_line(char *linebuf, int len, unsigned int flags)
+static int sanitize_line(char *linebuf, int len, unsigned int flags, int first_call)
 {
     int i;
+    if (first_call) {
+        /* Other BOMs imply unsupported multibyte encoding,
+         * so don't strip them and let the error raise */
+        const unsigned char utf8_bom[3] = {0xEF, 0xBB, 0xBF};
+
+        if (len > 3 && memcmp(linebuf, utf8_bom, 3) == 0) {
+            memmove(linebuf, linebuf + 3, len - 3);
+            linebuf[len - 3] = 0;
+            len -= 3;
+        }
+    }
 
     if (flags & PEM_FLAG_EAY_COMPATIBLE) {
         /* Strip trailing whitespace */
@@ -726,6 +743,7 @@ static int get_name(BIO *bp, char **name, unsigned int flags)
     char *linebuf;
     int ret = 0;
     int len;
+    int first_call = 1;
 
     /*
      * Need to hold trailing NUL (accounted for by BIO_gets() and the newline
@@ -746,7 +764,8 @@ static int get_name(BIO *bp, char **name, unsigned int flags)
         }
 
         /* Strip trailing garbage and standardize ending. */
-        len = sanitize_line(linebuf, len, flags & ~PEM_FLAG_ONLY_B64);
+        len = sanitize_line(linebuf, len, flags & ~PEM_FLAG_ONLY_B64, first_call);
+        first_call = 0;
 
         /* Allow leading empty or non-matching lines. */
     } while (strncmp(linebuf, beginstr, BEGINLEN) != 0
@@ -790,7 +809,7 @@ static int get_header_and_data(BIO *bp, BIO **header, BIO **data, char *name,
 {
     BIO *tmp = *header;
     char *linebuf, *p;
-    int len, line, ret = 0, end = 0;
+    int len, line, ret = 0, end = 0, prev_partial_line_read = 0, partial_line_read = 0;
     /* 0 if not seen (yet), 1 if reading header, 2 if finished header */
     enum header_status got_header = MAYBE_HEADER;
     unsigned int flags_mask;
@@ -808,9 +827,17 @@ static int get_header_and_data(BIO *bp, BIO **header, BIO **data, char *name,
         flags_mask = ~0u;
         len = BIO_gets(bp, linebuf, LINESIZE);
         if (len <= 0) {
-            PEMerr(PEM_F_GET_HEADER_AND_DATA, PEM_R_SHORT_HEADER);
+            PEMerr(PEM_F_GET_HEADER_AND_DATA, PEM_R_BAD_END_LINE);
             goto err;
         }
+
+        /*
+         * Check if line has been read completely or if only part of the line
+         * has been read. Keep the previous value to ignore newlines that
+         * appear due to reading a line up until the char before the newline.
+         */
+        prev_partial_line_read = partial_line_read;
+        partial_line_read = len == LINESIZE-1 && linebuf[LINESIZE-2] != '\n';
 
         if (got_header == MAYBE_HEADER) {
             if (memchr(linebuf, ':', len) != NULL)
@@ -818,17 +845,23 @@ static int get_header_and_data(BIO *bp, BIO **header, BIO **data, char *name,
         }
         if (!strncmp(linebuf, endstr, ENDLEN) || got_header == IN_HEADER)
             flags_mask &= ~PEM_FLAG_ONLY_B64;
-        len = sanitize_line(linebuf, len, flags & flags_mask);
+        len = sanitize_line(linebuf, len, flags & flags_mask, 0);
 
         /* Check for end of header. */
         if (linebuf[0] == '\n') {
-            if (got_header == POST_HEADER) {
-                /* Another blank line is an error. */
-                PEMerr(PEM_F_GET_HEADER_AND_DATA, PEM_R_BAD_END_LINE);
-                goto err;
+            /*
+             * If previous line has been read only partially this newline is a
+             * regular newline at the end of a line and not an empty line.
+             */
+            if (!prev_partial_line_read) {
+                if (got_header == POST_HEADER) {
+                    /* Another blank line is an error. */
+                    PEMerr(PEM_F_GET_HEADER_AND_DATA, PEM_R_BAD_END_LINE);
+                    goto err;
+                }
+                got_header = POST_HEADER;
+                tmp = *data;
             }
-            got_header = POST_HEADER;
-            tmp = *data;
             continue;
         }
 
@@ -879,8 +912,7 @@ err:
  * Read in PEM-formatted data from the given BIO.
  *
  * By nature of the PEM format, all content must be printable ASCII (except
- * for line endings).  Other characters, or lines that are longer than 80
- * characters, are malformed input and will be rejected.
+ * for line endings).  Other characters are malformed input and will be rejected.
  */
 int PEM_read_bio_ex(BIO *bp, char **name_out, char **header,
                     unsigned char **data, long *len_out, unsigned int flags)

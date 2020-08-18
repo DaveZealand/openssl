@@ -1,7 +1,7 @@
 /*
- * Copyright 2001-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2001-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -16,7 +16,11 @@
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
 #include <openssl/ocsp.h>
-#include "ocsp_lcl.h"
+#include "ocsp_local.h"
+
+DEFINE_STACK_OF(X509)
+DEFINE_STACK_OF(OCSP_ONEREQ)
+DEFINE_STACK_OF(OCSP_SINGLERESP)
 
 /*
  * Utility functions related to sending OCSP requests and extracting relevant
@@ -48,7 +52,7 @@ OCSP_ONEREQ *OCSP_request_add0_id(OCSP_REQUEST *req, OCSP_CERTID *cid)
 
 /* Set requestorName from an X509_NAME structure */
 
-int OCSP_request_set1_name(OCSP_REQUEST *req, X509_NAME *nm)
+int OCSP_request_set1_name(OCSP_REQUEST *req, const X509_NAME *nm)
 {
     GENERAL_NAME *gen;
 
@@ -77,14 +81,7 @@ int OCSP_request_add1_cert(OCSP_REQUEST *req, X509 *cert)
         return 0;
     if (cert == NULL)
         return 1;
-    if (sig->certs == NULL
-        && (sig->certs = sk_X509_new_null()) == NULL)
-        return 0;
-
-    if (!sk_X509_push(sig->certs, cert))
-        return 0;
-    X509_up_ref(cert);
-    return 1;
+    return X509_add_cert_new(&sig->certs, cert, X509_ADD_FLAG_UP_REF);
 }
 
 /*
@@ -165,6 +162,16 @@ OCSP_BASICRESP *OCSP_response_get1_basic(OCSP_RESPONSE *resp)
 const ASN1_OCTET_STRING *OCSP_resp_get0_signature(const OCSP_BASICRESP *bs)
 {
     return bs->signature;
+}
+
+const X509_ALGOR *OCSP_resp_get0_tbs_sigalg(const OCSP_BASICRESP *bs)
+{
+    return &bs->signatureAlgorithm;
+}
+
+const OCSP_RESPDATA *OCSP_resp_get0_respdata(const OCSP_BASICRESP *bs)
+{
+    return &bs->tbsResponseData;
 }
 
 /*

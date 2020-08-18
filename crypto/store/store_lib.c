@@ -1,7 +1,7 @@
 /*
- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -11,15 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-
-#include "e_os.h"
-
 #include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/trace.h>
 #include <openssl/store.h>
 #include "internal/thread_once.h"
-#include "internal/store_int.h"
-#include "store_locl.h"
+#include "crypto/store.h"
+#include "store_local.h"
 
 struct ossl_store_ctx_st {
     const OSSL_STORE_LOADER *loader;
@@ -34,10 +32,10 @@ struct ossl_store_ctx_st {
     int loading;
 };
 
-OSSL_STORE_CTX *OSSL_STORE_open(const char *uri, const UI_METHOD *ui_method,
-                                void *ui_data,
-                                OSSL_STORE_post_process_info_fn post_process,
-                                void *post_process_data)
+OSSL_STORE_CTX *OSSL_STORE_open_with_libctx(
+    const char *uri, OPENSSL_CTX *libctx, const char *propq,
+    const UI_METHOD *ui_method, void *ui_data,
+    OSSL_STORE_post_process_info_fn post_process, void *post_process_data)
 {
     const OSSL_STORE_LOADER *loader = NULL;
     OSSL_STORE_LOADER_CTX *loader_ctx = NULL;
@@ -74,14 +72,23 @@ OSSL_STORE_CTX *OSSL_STORE_open(const char *uri, const UI_METHOD *ui_method,
 
     /* Try each scheme until we find one that could open the URI */
     for (i = 0; loader_ctx == NULL && i < schemes_n; i++) {
-        if ((loader = ossl_store_get0_loader_int(schemes[i])) != NULL)
-            loader_ctx = loader->open(loader, uri, ui_method, ui_data);
+        OSSL_TRACE1(STORE, "Looking up scheme %s\n", schemes[i]);
+        if ((loader = ossl_store_get0_loader_int(schemes[i])) != NULL) {
+            OSSL_TRACE1(STORE, "Found loader for scheme %s\n", schemes[i]);
+            if (loader->open_with_libctx != NULL)
+                loader_ctx = loader->open_with_libctx(loader, uri, libctx, propq,
+                                                      ui_method, ui_data);
+            else
+                loader_ctx = loader->open(loader, uri, ui_method, ui_data);
+            OSSL_TRACE2(STORE, "Opened %s => %p\n", uri, (void *)loader_ctx);
+        }
     }
+
     if (loader_ctx == NULL)
         goto err;
 
     if ((ctx = OPENSSL_zalloc(sizeof(*ctx))) == NULL) {
-        OSSL_STOREerr(OSSL_STORE_F_OSSL_STORE_OPEN, ERR_R_MALLOC_FAILURE);
+        OSSL_STOREerr(0, ERR_R_MALLOC_FAILURE);
         goto err;
     }
 
@@ -112,6 +119,15 @@ OSSL_STORE_CTX *OSSL_STORE_open(const char *uri, const UI_METHOD *ui_method,
         (void)loader->close(loader_ctx);
     }
     return NULL;
+}
+
+OSSL_STORE_CTX *OSSL_STORE_open(const char *uri,
+                                const UI_METHOD *ui_method, void *ui_data,
+                                OSSL_STORE_post_process_info_fn post_process,
+                                void *post_process_data)
+{
+    return OSSL_STORE_open_with_libctx(uri, NULL, NULL, ui_method, ui_data,
+                                       post_process, post_process_data);
 }
 
 int OSSL_STORE_ctrl(OSSL_STORE_CTX *ctx, int cmd, ...)
@@ -147,7 +163,7 @@ int OSSL_STORE_expect(OSSL_STORE_CTX *ctx, int expected_type)
     return 1;
 }
 
-int OSSL_STORE_find(OSSL_STORE_CTX *ctx, OSSL_STORE_SEARCH *search)
+int OSSL_STORE_find(OSSL_STORE_CTX *ctx, const OSSL_STORE_SEARCH *search)
 {
     if (ctx->loading) {
         OSSL_STOREerr(OSSL_STORE_F_OSSL_STORE_FIND,
@@ -172,6 +188,7 @@ OSSL_STORE_INFO *OSSL_STORE_load(OSSL_STORE_CTX *ctx)
     if (OSSL_STORE_eof(ctx))
         return NULL;
 
+    OSSL_TRACE(STORE, "Loading next object\n");
     v = ctx->loader->load(ctx->loader_ctx, ctx->ui_method, ctx->ui_data);
 
     if (ctx->post_process != NULL && v != NULL) {
@@ -203,6 +220,10 @@ OSSL_STORE_INFO *OSSL_STORE_load(OSSL_STORE_CTX *ctx)
         }
     }
 
+    if (v != NULL)
+        OSSL_TRACE1(STORE, "Got a %s\n",
+                    OSSL_STORE_INFO_type_string(OSSL_STORE_INFO_get_type(v)));
+
     return v;
 }
 
@@ -218,7 +239,12 @@ int OSSL_STORE_eof(OSSL_STORE_CTX *ctx)
 
 int OSSL_STORE_close(OSSL_STORE_CTX *ctx)
 {
-    int loader_ret = ctx->loader->close(ctx->loader_ctx);
+    int loader_ret;
+
+    if (ctx == NULL)
+        return 1;
+    OSSL_TRACE1(STORE, "Closing %p\n", (void *)ctx->loader_ctx);
+    loader_ret = ctx->loader->close(ctx->loader_ctx);
 
     OPENSSL_free(ctx);
     return loader_ret;
@@ -228,7 +254,7 @@ int OSSL_STORE_close(OSSL_STORE_CTX *ctx)
  * Functions to generate OSSL_STORE_INFOs, one function for each type we
  * support having in them as well as a generic constructor.
  *
- * In all cases, ownership of the object is transfered to the OSSL_STORE_INFO
+ * In all cases, ownership of the object is transferred to the OSSL_STORE_INFO
  * and will therefore be freed when the OSSL_STORE_INFO is freed.
  */
 static OSSL_STORE_INFO *store_info_new(int type, void *data)
@@ -495,7 +521,7 @@ OSSL_STORE_SEARCH *OSSL_STORE_SEARCH_by_name(X509_NAME *name)
 }
 
 OSSL_STORE_SEARCH *OSSL_STORE_SEARCH_by_issuer_serial(X509_NAME *name,
-                                                    const ASN1_INTEGER *serial)
+                                                      const ASN1_INTEGER *serial)
 {
     OSSL_STORE_SEARCH *search = OPENSSL_zalloc(sizeof(*search));
 
@@ -569,13 +595,13 @@ int OSSL_STORE_SEARCH_get_type(const OSSL_STORE_SEARCH *criterion)
     return criterion->search_type;
 }
 
-X509_NAME *OSSL_STORE_SEARCH_get0_name(OSSL_STORE_SEARCH *criterion)
+X509_NAME *OSSL_STORE_SEARCH_get0_name(const OSSL_STORE_SEARCH *criterion)
 {
     return criterion->name;
 }
 
 const ASN1_INTEGER *OSSL_STORE_SEARCH_get0_serial(const OSSL_STORE_SEARCH
-                                                 *criterion)
+                                                  *criterion)
 {
     return criterion->serial;
 }
@@ -637,45 +663,33 @@ char *ossl_store_info_get0_EMBEDDED_pem_name(OSSL_STORE_INFO *info)
     return NULL;
 }
 
-OSSL_STORE_CTX *ossl_store_attach_pem_bio(BIO *bp, const UI_METHOD *ui_method,
-                                          void *ui_data)
+OSSL_STORE_CTX *OSSL_STORE_attach(BIO *bp, const char *scheme,
+                                  OPENSSL_CTX *libctx, const char *propq,
+                                  const UI_METHOD *ui_method, void *ui_data,
+                                  OSSL_STORE_post_process_info_fn post_process,
+                                  void *post_process_data)
 {
     OSSL_STORE_CTX *ctx = NULL;
     const OSSL_STORE_LOADER *loader = NULL;
     OSSL_STORE_LOADER_CTX *loader_ctx = NULL;
 
-    if ((loader = ossl_store_get0_loader_int("file")) == NULL
-        || ((loader_ctx = ossl_store_file_attach_pem_bio_int(bp)) == NULL))
-        goto done;
+    if ((loader =
+         ossl_store_get0_loader_int(scheme != NULL ? scheme : "file")) == NULL
+        || (loader_ctx = loader->attach(loader, bp, libctx, propq,
+                                        ui_method, ui_data)) == NULL)
+        return NULL;
+
     if ((ctx = OPENSSL_zalloc(sizeof(*ctx))) == NULL) {
-        OSSL_STOREerr(OSSL_STORE_F_OSSL_STORE_ATTACH_PEM_BIO,
-                     ERR_R_MALLOC_FAILURE);
-        goto done;
+        OSSL_STOREerr(OSSL_STORE_F_OSSL_STORE_ATTACH, ERR_R_MALLOC_FAILURE);
+        return NULL;
     }
 
     ctx->loader = loader;
     ctx->loader_ctx = loader_ctx;
-    loader_ctx = NULL;
     ctx->ui_method = ui_method;
     ctx->ui_data = ui_data;
-    ctx->post_process = NULL;
-    ctx->post_process_data = NULL;
+    ctx->post_process = post_process;
+    ctx->post_process_data = post_process_data;
 
- done:
-    if (loader_ctx != NULL)
-        /*
-         * We ignore a returned error because we will return NULL anyway in
-         * this case, so if something goes wrong when closing, that'll simply
-         * just add another entry on the error stack.
-         */
-        (void)loader->close(loader_ctx);
     return ctx;
-}
-
-int ossl_store_detach_pem_bio(OSSL_STORE_CTX *ctx)
-{
-    int loader_ret = ossl_store_file_detach_pem_bio_int(ctx->loader_ctx);
-
-    OPENSSL_free(ctx);
-    return loader_ret;
 }

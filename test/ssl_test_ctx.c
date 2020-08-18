@@ -1,7 +1,7 @@
 /*
- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -19,6 +19,9 @@
 #ifdef OPENSSL_SYS_WINDOWS
 # define strcasecmp _stricmp
 #endif
+
+DEFINE_STACK_OF(CONF_VALUE)
+DEFINE_STACK_OF(X509_NAME)
 
 static const int default_app_data_size = 256;
 /* Default set to be as small as possible to exercise fragmentation. */
@@ -126,6 +129,7 @@ static const test_enum ssl_alerts[] = {
     {"UnrecognizedName", SSL_AD_UNRECOGNIZED_NAME},
     {"BadCertificate", SSL_AD_BAD_CERTIFICATE},
     {"NoApplicationProtocol", SSL_AD_NO_APPLICATION_PROTOCOL},
+    {"CertificateRequired", SSL_AD_CERTIFICATE_REQUIRED},
 };
 
 __owur static int parse_alert(int *alert, const char *value)
@@ -445,6 +449,8 @@ const char *ssl_ct_validation_name(ssl_ct_validation_t mode)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, resumption_expected)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_SERVER_CONF, server, broken_session_ticket)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, use_sctp)
+IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, enable_client_sctp_label_bug)
+IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, enable_server_sctp_label_bug)
 
 /* CertStatus */
 
@@ -603,35 +609,38 @@ __owur static int parse_expected_client_sign_hash(SSL_TEST_CTX *test_ctx,
 }
 
 __owur static int parse_expected_ca_names(STACK_OF(X509_NAME) **pnames,
-                                          const char *value)
+                                          const char *value, OPENSSL_CTX *libctx)
 {
     if (value == NULL)
         return 0;
     if (!strcmp(value, "empty"))
         *pnames = sk_X509_NAME_new_null();
     else
-        *pnames = SSL_load_client_CA_file(value);
+        *pnames = SSL_load_client_CA_file_with_libctx(value, libctx, NULL);
     return *pnames != NULL;
 }
 __owur static int parse_expected_server_ca_names(SSL_TEST_CTX *test_ctx,
                                                  const char *value)
 {
-    return parse_expected_ca_names(&test_ctx->expected_server_ca_names, value);
+    return parse_expected_ca_names(&test_ctx->expected_server_ca_names, value,
+                                   test_ctx->libctx);
 }
 __owur static int parse_expected_client_ca_names(SSL_TEST_CTX *test_ctx,
                                                  const char *value)
 {
-    return parse_expected_ca_names(&test_ctx->expected_client_ca_names, value);
+    return parse_expected_ca_names(&test_ctx->expected_client_ca_names, value,
+                                   test_ctx->libctx);
 }
 
 /* ExpectedCipher */
 
 IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CTX, test, expected_cipher)
 
-/* Client and Server ForcePHA */
+/* Client and Server PHA */
 
-IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CLIENT_CONF, client, force_pha)
+IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CLIENT_CONF, client, enable_pha)
 IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_SERVER_CONF, server, force_pha)
+IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CLIENT_CONF, client, no_extms_on_reneg)
 
 /* Known test options and their corresponding parse methods. */
 
@@ -668,6 +677,8 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
     { "ExpectedClientSignType", &parse_expected_client_sign_type },
     { "ExpectedClientCANames", &parse_expected_client_ca_names },
     { "UseSCTP", &parse_test_use_sctp },
+    { "EnableClientSCTPLabelBug", &parse_test_enable_client_sctp_label_bug },
+    { "EnableServerSCTPLabelBug", &parse_test_enable_server_sctp_label_bug },
     { "ExpectedCipher", &parse_test_expected_cipher },
     { "ExpectedSessionTicketAppData", &parse_test_expected_session_ticket_app_data },
 };
@@ -688,7 +699,8 @@ static const ssl_test_client_option ssl_test_client_options[] = {
     { "SRPUser", &parse_client_srp_user },
     { "SRPPassword", &parse_client_srp_password },
     { "MaxFragmentLenExt", &parse_max_fragment_len_mode },
-    { "ForcePHA", &parse_client_force_pha },
+    { "EnablePHA", &parse_client_enable_pha },
+    { "RenegotiateNoExtms", &parse_client_no_extms_on_reneg },
 };
 
 /* Nested server options. */
@@ -709,12 +721,13 @@ static const ssl_test_server_option ssl_test_server_options[] = {
     { "SessionTicketAppData", &parse_server_session_ticket_app_data },
 };
 
-SSL_TEST_CTX *SSL_TEST_CTX_new(void)
+SSL_TEST_CTX *SSL_TEST_CTX_new(OPENSSL_CTX *libctx)
 {
     SSL_TEST_CTX *ret;
 
     /* The return code is checked by caller */
     if ((ret = OPENSSL_zalloc(sizeof(*ret))) != NULL) {
+        ret->libctx = libctx;
         ret->app_data_size = default_app_data_size;
         ret->max_fragment_size = default_max_fragment_size;
     }
@@ -748,6 +761,8 @@ static void ssl_test_ctx_free_extra_data(SSL_TEST_CTX *ctx)
 
 void SSL_TEST_CTX_free(SSL_TEST_CTX *ctx)
 {
+    if (ctx == NULL)
+        return;
     ssl_test_ctx_free_extra_data(ctx);
     OPENSSL_free(ctx->expected_npn_protocol);
     OPENSSL_free(ctx->expected_alpn_protocol);
@@ -824,7 +839,8 @@ static int parse_server_options(SSL_TEST_SERVER_CONF *server, const CONF *conf,
     return 1;
 }
 
-SSL_TEST_CTX *SSL_TEST_CTX_create(const CONF *conf, const char *test_section)
+SSL_TEST_CTX *SSL_TEST_CTX_create(const CONF *conf, const char *test_section,
+                                  OPENSSL_CTX *libctx)
 {
     STACK_OF(CONF_VALUE) *sk_conf = NULL;
     SSL_TEST_CTX *ctx = NULL;
@@ -832,7 +848,7 @@ SSL_TEST_CTX *SSL_TEST_CTX_create(const CONF *conf, const char *test_section)
     size_t j;
 
     if (!TEST_ptr(sk_conf = NCONF_get_section(conf, test_section))
-            || !TEST_ptr(ctx = SSL_TEST_CTX_new()))
+            || !TEST_ptr(ctx = SSL_TEST_CTX_new(libctx)))
         goto err;
 
     for (i = 0; i < sk_CONF_VALUE_num(sk_conf); i++) {

@@ -1,14 +1,20 @@
 /*
- * Copyright 1999-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1999-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
 
-#ifndef HEADER_PKCS12_H
-# define HEADER_PKCS12_H
+#ifndef OPENSSL_PKCS12_H
+# define OPENSSL_PKCS12_H
+# pragma once
+
+# include <openssl/macros.h>
+# ifndef OPENSSL_NO_DEPRECATED_3_0
+#  define HEADER_PKCS12_H
+# endif
 
 # include <openssl/bio.h>
 # include <openssl/x509.h>
@@ -46,7 +52,7 @@ typedef struct PKCS12_st PKCS12;
 
 typedef struct PKCS12_SAFEBAG_st PKCS12_SAFEBAG;
 
-DEFINE_STACK_OF(PKCS12_SAFEBAG)
+DEFINE_OR_DECLARE_STACK_OF(PKCS12_SAFEBAG)
 
 typedef struct pkcs12_bag_st PKCS12_BAGS;
 
@@ -55,7 +61,7 @@ typedef struct pkcs12_bag_st PKCS12_BAGS;
 
 /* Compatibility macros */
 
-#if OPENSSL_API_COMPAT < 0x10100000L
+#ifndef OPENSSL_NO_DEPRECATED_1_1_0
 
 # define M_PKCS12_bag_type PKCS12_bag_type
 # define M_PKCS12_cert_bag_type PKCS12_cert_bag_type
@@ -87,6 +93,8 @@ const ASN1_TYPE *PKCS12_SAFEBAG_get0_attr(const PKCS12_SAFEBAG *bag,
 const ASN1_OBJECT *PKCS12_SAFEBAG_get0_type(const PKCS12_SAFEBAG *bag);
 int PKCS12_SAFEBAG_get_nid(const PKCS12_SAFEBAG *bag);
 int PKCS12_SAFEBAG_get_bag_nid(const PKCS12_SAFEBAG *bag);
+const ASN1_TYPE *PKCS12_SAFEBAG_get0_bag_obj(const PKCS12_SAFEBAG *bag);
+const ASN1_OBJECT *PKCS12_SAFEBAG_get0_bag_type(const PKCS12_SAFEBAG *bag);
 
 X509 *PKCS12_SAFEBAG_get1_cert(const PKCS12_SAFEBAG *bag);
 X509_CRL *PKCS12_SAFEBAG_get1_crl(const PKCS12_SAFEBAG *bag);
@@ -97,6 +105,7 @@ const X509_SIG *PKCS12_SAFEBAG_get0_pkcs8(const PKCS12_SAFEBAG *bag);
 
 PKCS12_SAFEBAG *PKCS12_SAFEBAG_create_cert(X509 *x509);
 PKCS12_SAFEBAG *PKCS12_SAFEBAG_create_crl(X509_CRL *crl);
+PKCS12_SAFEBAG *PKCS12_SAFEBAG_create_secret(int type, int vtype, const unsigned char *value, int len);
 PKCS12_SAFEBAG *PKCS12_SAFEBAG_create0_p8inf(PKCS8_PRIV_KEY_INFO *p8);
 PKCS12_SAFEBAG *PKCS12_SAFEBAG_create0_pkcs8(X509_SIG *p8);
 PKCS12_SAFEBAG *PKCS12_SAFEBAG_create_pkcs8_encrypt(int pbe_nid,
@@ -138,6 +147,10 @@ int PKCS12_add_CSPName_asc(PKCS12_SAFEBAG *bag, const char *name,
                            int namelen);
 int PKCS12_add_friendlyname_uni(PKCS12_SAFEBAG *bag,
                                 const unsigned char *name, int namelen);
+int PKCS12_add1_attr_by_NID(PKCS12_SAFEBAG *bag, int nid, int type,
+                            const unsigned char *bytes, int len);
+int PKCS12_add1_attr_by_txt(PKCS12_SAFEBAG *bag, const char *attrname, int type,
+                            const unsigned char *bytes, int len);
 int PKCS8_add_keyusage(PKCS8_PRIV_KEY_INFO *p8, int usage);
 ASN1_TYPE *PKCS12_get_attr_gen(const STACK_OF(X509_ATTRIBUTE) *attrs,
                                int attr_nid);
@@ -203,13 +216,15 @@ PKCS12_SAFEBAG *PKCS12_add_cert(STACK_OF(PKCS12_SAFEBAG) **pbags, X509 *cert);
 PKCS12_SAFEBAG *PKCS12_add_key(STACK_OF(PKCS12_SAFEBAG) **pbags,
                                EVP_PKEY *key, int key_usage, int iter,
                                int key_nid, const char *pass);
+PKCS12_SAFEBAG *PKCS12_add_secret(STACK_OF(PKCS12_SAFEBAG) **pbags,
+                                  int nid_type, const unsigned char *value, int len);
 int PKCS12_add_safe(STACK_OF(PKCS7) **psafes, STACK_OF(PKCS12_SAFEBAG) *bags,
                     int safe_nid, int iter, const char *pass);
 PKCS12 *PKCS12_add_safes(STACK_OF(PKCS7) *safes, int p7_nid);
 
-int i2d_PKCS12_bio(BIO *bp, PKCS12 *p12);
+int i2d_PKCS12_bio(BIO *bp, const PKCS12 *p12);
 # ifndef OPENSSL_NO_STDIO
-int i2d_PKCS12_fp(FILE *fp, PKCS12 *p12);
+int i2d_PKCS12_fp(FILE *fp, const PKCS12 *p12);
 # endif
 PKCS12 *d2i_PKCS12_bio(BIO *bp, PKCS12 **p12);
 # ifndef OPENSSL_NO_STDIO

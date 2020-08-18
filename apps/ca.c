@@ -1,7 +1,7 @@
 /*
- * Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
@@ -33,6 +33,11 @@
 
 #include "apps.h"
 #include "progs.h"
+
+DEFINE_STACK_OF(X509)
+DEFINE_STACK_OF(X509_EXTENSION)
+DEFINE_STACK_OF(CONF_VALUE)
+DEFINE_STACK_OF_STRING()
 
 #ifndef W_OK
 # define F_OK 0
@@ -88,8 +93,11 @@ typedef enum {
 
 static char *lookup_conf(const CONF *conf, const char *group, const char *tag);
 
-static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
-                   const EVP_MD *dgst, STACK_OF(OPENSSL_STRING) *sigopts,
+static int certify(X509 **xret, const char *infile, int informat,
+                   EVP_PKEY *pkey, X509 *x509,
+                   const EVP_MD *dgst,
+                   STACK_OF(OPENSSL_STRING) *sigopts,
+                   STACK_OF(OPENSSL_STRING) *vfyopts,
                    STACK_OF(CONF_VALUE) *policy, CA_DB *db,
                    BIGNUM *serial, const char *subj, unsigned long chtype,
                    int multirdn, int email_dn, const char *startdate,
@@ -97,8 +105,11 @@ static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
                    long days, int batch, const char *ext_sect, CONF *conf,
                    int verbose, unsigned long certopt, unsigned long nameopt,
                    int default_op, int ext_copy, int selfsign);
-static int certify_cert(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
-                        const EVP_MD *dgst, STACK_OF(OPENSSL_STRING) *sigopts,
+static int certify_cert(X509 **xret, const char *infile, int informat,
+                        EVP_PKEY *pkey, X509 *x509,
+                        const EVP_MD *dgst,
+                        STACK_OF(OPENSSL_STRING) *sigopts,
+                        STACK_OF(OPENSSL_STRING) *vfyopts,
                         STACK_OF(CONF_VALUE) *policy, CA_DB *db,
                         BIGNUM *serial, const char *subj, unsigned long chtype,
                         int multirdn, int email_dn, const char *startdate,
@@ -141,24 +152,49 @@ typedef enum OPTION_choice {
     OPT_ENGINE, OPT_VERBOSE, OPT_CONFIG, OPT_NAME, OPT_SUBJ, OPT_UTF8,
     OPT_CREATE_SERIAL, OPT_MULTIVALUE_RDN, OPT_STARTDATE, OPT_ENDDATE,
     OPT_DAYS, OPT_MD, OPT_POLICY, OPT_KEYFILE, OPT_KEYFORM, OPT_PASSIN,
-    OPT_KEY, OPT_CERT, OPT_SELFSIGN, OPT_IN, OPT_OUT, OPT_OUTDIR,
+    OPT_KEY, OPT_CERT, OPT_CERTFORM, OPT_SELFSIGN,
+    OPT_IN, OPT_INFORM, OPT_OUT, OPT_OUTDIR, OPT_VFYOPT,
     OPT_SIGOPT, OPT_NOTEXT, OPT_BATCH, OPT_PRESERVEDN, OPT_NOEMAILDN,
     OPT_GENCRL, OPT_MSIE_HACK, OPT_CRLDAYS, OPT_CRLHOURS, OPT_CRLSEC,
     OPT_INFILES, OPT_SS_CERT, OPT_SPKAC, OPT_REVOKE, OPT_VALID,
     OPT_EXTENSIONS, OPT_EXTFILE, OPT_STATUS, OPT_UPDATEDB, OPT_CRLEXTS,
     OPT_RAND_SERIAL,
-    OPT_R_ENUM,
+    OPT_R_ENUM, OPT_PROV_ENUM,
     /* Do not change the order here; see related case statements below */
     OPT_CRL_REASON, OPT_CRL_HOLD, OPT_CRL_COMPROMISE, OPT_CRL_CA_COMPROMISE
 } OPTION_CHOICE;
 
 const OPTIONS ca_options[] = {
+    {OPT_HELP_STR, 1, '-', "Usage: %s [options] [certreq...]\n"},
+
+    OPT_SECTION("General"),
     {"help", OPT_HELP, '-', "Display this summary"},
     {"verbose", OPT_VERBOSE, '-', "Verbose output during processing"},
+    {"outdir", OPT_OUTDIR, '/', "Where to put output cert"},
+    {"in", OPT_IN, '<', "The input cert request(s)"},
+    {"inform", OPT_INFORM, 'F', "CSR input format (DER or PEM); default PEM"},
+    {"infiles", OPT_INFILES, '-', "The last argument, requests to process"},
+    {"out", OPT_OUT, '>', "Where to put the output file(s)"},
+    {"notext", OPT_NOTEXT, '-', "Do not print the generated certificate"},
+    {"batch", OPT_BATCH, '-', "Don't ask questions"},
+    {"msie_hack", OPT_MSIE_HACK, '-',
+     "msie modifications to handle all Universal Strings"},
+    {"ss_cert", OPT_SS_CERT, '<', "File contains a self signed cert to sign"},
+    {"spkac", OPT_SPKAC, '<',
+     "File contains DN and signed public key and challenge"},
+#ifndef OPENSSL_NO_ENGINE
+    {"engine", OPT_ENGINE, 's', "Use engine, possibly a hardware device"},
+#endif
+
+    OPT_SECTION("Configuration"),
     {"config", OPT_CONFIG, 's', "A config file"},
     {"name", OPT_NAME, 's', "The particular CA definition to use"},
+    {"section", OPT_NAME, 's', "An alias for -name"},
+    {"policy", OPT_POLICY, 's', "The CA 'policy' to support"},
+
+    OPT_SECTION("Certificate"),
     {"subj", OPT_SUBJ, 's', "Use arg instead of request's subject"},
-    {"utf8", OPT_UTF8, '-', "Input characters are UTF8 (default ASCII)"},
+    {"utf8", OPT_UTF8, '-', "Input characters are UTF8; default ASCII"},
     {"create_serial", OPT_CREATE_SERIAL, '-',
      "If reading serial fails, create a new random serial"},
     {"rand_serial", OPT_RAND_SERIAL, '-',
@@ -169,40 +205,31 @@ const OPTIONS ca_options[] = {
     {"enddate", OPT_ENDDATE, 's',
      "YYMMDDHHMMSSZ cert notAfter (overrides -days)"},
     {"days", OPT_DAYS, 'p', "Number of days to certify the cert for"},
-    {"md", OPT_MD, 's', "md to use; one of md2, md5, sha or sha1"},
-    {"policy", OPT_POLICY, 's', "The CA 'policy' to support"},
-    {"keyfile", OPT_KEYFILE, 's', "Private key"},
-    {"keyform", OPT_KEYFORM, 'f', "Private key file format (PEM or ENGINE)"},
-    {"passin", OPT_PASSIN, 's', "Input file pass phrase source"},
-    {"key", OPT_KEY, 's', "Key to decode the private key if it is encrypted"},
-    {"cert", OPT_CERT, '<', "The CA cert"},
-    {"selfsign", OPT_SELFSIGN, '-',
-     "Sign a cert with the key associated with it"},
-    {"in", OPT_IN, '<', "The input PEM encoded cert request(s)"},
-    {"out", OPT_OUT, '>', "Where to put the output file(s)"},
-    {"outdir", OPT_OUTDIR, '/', "Where to put output cert"},
-    {"sigopt", OPT_SIGOPT, 's', "Signature parameter in n:v form"},
-    {"notext", OPT_NOTEXT, '-', "Do not print the generated certificate"},
-    {"batch", OPT_BATCH, '-', "Don't ask questions"},
-    {"preserveDN", OPT_PRESERVEDN, '-', "Don't re-order the DN"},
-    {"noemailDN", OPT_NOEMAILDN, '-', "Don't add the EMAIL field to the DN"},
-    {"gencrl", OPT_GENCRL, '-', "Generate a new CRL"},
-    {"msie_hack", OPT_MSIE_HACK, '-',
-     "msie modifications to handle all those universal strings"},
-    {"crldays", OPT_CRLDAYS, 'p', "Days until the next CRL is due"},
-    {"crlhours", OPT_CRLHOURS, 'p', "Hours until the next CRL is due"},
-    {"crlsec", OPT_CRLSEC, 'p', "Seconds until the next CRL is due"},
-    {"infiles", OPT_INFILES, '-', "The last argument, requests to process"},
-    {"ss_cert", OPT_SS_CERT, '<', "File contains a self signed cert to sign"},
-    {"spkac", OPT_SPKAC, '<',
-     "File contains DN and signed public key and challenge"},
-    {"revoke", OPT_REVOKE, '<', "Revoke a cert (given in file)"},
-    {"valid", OPT_VALID, 's',
-     "Add a Valid(not-revoked) DB entry about a cert (given in file)"},
     {"extensions", OPT_EXTENSIONS, 's',
      "Extension section (override value in config file)"},
     {"extfile", OPT_EXTFILE, '<',
      "Configuration file with X509v3 extensions to add"},
+    {"preserveDN", OPT_PRESERVEDN, '-', "Don't re-order the DN"},
+    {"noemailDN", OPT_NOEMAILDN, '-', "Don't add the EMAIL field to the DN"},
+
+    OPT_SECTION("Signing"),
+    {"md", OPT_MD, 's', "md to use; one of md2, md5, sha or sha1"},
+    {"keyfile", OPT_KEYFILE, 's', "Private key"},
+    {"keyform", OPT_KEYFORM, 'f', "Private key file format (ENGINE, other values ignored)"},
+    {"passin", OPT_PASSIN, 's', "Input file pass phrase source"},
+    {"key", OPT_KEY, 's', "Key to decode the private key if it is encrypted"},
+    {"cert", OPT_CERT, '<', "The CA cert"},
+    {"certform", OPT_CERTFORM, 'F',
+     "certificate input format (DER/PEM/P12); has no effect"},
+    {"selfsign", OPT_SELFSIGN, '-',
+     "Sign a cert with the key associated with it"},
+    {"sigopt", OPT_SIGOPT, 's', "Signature parameter in n:v form"},
+    {"vfyopt", OPT_SIGOPT, 's', "Verification parameter in n:v form"},
+
+    OPT_SECTION("Revocation"),
+    {"gencrl", OPT_GENCRL, '-', "Generate a new CRL"},
+    {"valid", OPT_VALID, 's',
+     "Add a Valid(not-revoked) DB entry about a cert (given in file)"},
     {"status", OPT_STATUS, 's', "Shows cert status given the serial number"},
     {"updatedb", OPT_UPDATEDB, '-', "Updates db for expired cert"},
     {"crlexts", OPT_CRLEXTS, 's',
@@ -214,10 +241,16 @@ const OPTIONS ca_options[] = {
      "sets compromise time to val and the revocation reason to keyCompromise"},
     {"crl_CA_compromise", OPT_CRL_CA_COMPROMISE, 's',
      "sets compromise time to val and the revocation reason to CACompromise"},
+    {"crldays", OPT_CRLDAYS, 'p', "Days until the next CRL is due"},
+    {"crlhours", OPT_CRLHOURS, 'p', "Hours until the next CRL is due"},
+    {"crlsec", OPT_CRLSEC, 'p', "Seconds until the next CRL is due"},
+    {"revoke", OPT_REVOKE, '<', "Revoke a cert (given in file)"},
+
     OPT_R_OPTIONS,
-#ifndef OPENSSL_NO_ENGINE
-    {"engine", OPT_ENGINE, 's', "Use engine, possibly a hardware device"},
-#endif
+    OPT_PROV_OPTIONS,
+
+    OPT_PARAMETERS(),
+    {"certreq", 0, 0, "Certificate requests to be signed (optional)"},
     {NULL}
 };
 
@@ -233,13 +266,14 @@ int ca_main(int argc, char **argv)
     CA_DB *db = NULL;
     DB_ATTR db_attr;
     STACK_OF(CONF_VALUE) *attribs = NULL;
-    STACK_OF(OPENSSL_STRING) *sigopts = NULL;
+    STACK_OF(OPENSSL_STRING) *sigopts = NULL, *vfyopts = NULL;
     STACK_OF(X509) *cert_sk = NULL;
     X509_CRL *crl = NULL;
     const EVP_MD *dgst = NULL;
     char *configfile = default_config_file, *section = NULL;
     char *md = NULL, *policy = NULL, *keyfile = NULL;
     char *certfile = NULL, *crl_ext = NULL, *crlnumberfile = NULL, *key = NULL;
+    int certformat = FORMAT_PEM, informat = FORMAT_PEM;
     const char *infile = NULL, *spkac_file = NULL, *ss_cert_file = NULL;
     const char *extensions = NULL, *extfile = NULL, *passinarg = NULL;
     char *outdir = NULL, *outfile = NULL, *rev_arg = NULL, *ser_status = NULL;
@@ -255,7 +289,7 @@ int ca_main(int argc, char **argv)
     int batch = 0, default_op = 1, doupdatedb = 0, ext_copy = EXT_COPY_NONE;
     int keyformat = FORMAT_PEM, multirdn = 0, notext = 0, output_der = 0;
     int ret = 1, email_dn = 1, req = 0, verbose = 0, gencrl = 0, dorevoke = 0;
-    int rand_ser = 0, i, j, selfsign = 0;
+    int rand_ser = 0, i, j, selfsign = 0, def_nid, def_ret;
     long crldays = 0, crlhours = 0, crlsec = 0, days = 0;
     unsigned long chtype = MBSTRING_ASC, certopt = 0;
     X509 *x509 = NULL, *x509p = NULL, *x = NULL;
@@ -278,6 +312,10 @@ opthelp:
         case OPT_IN:
             req = 1;
             infile = opt_arg();
+            break;
+        case OPT_INFORM:
+            if (!opt_format(opt_arg(), OPT_FMT_PEMDER, &informat))
+                goto opthelp;
             break;
         case OPT_OUT:
             outfile = opt_arg();
@@ -336,11 +374,19 @@ opthelp:
             if (!opt_rand(o))
                 goto end;
             break;
+        case OPT_PROV_CASES:
+            if (!opt_provider(o))
+                goto end;
+            break;
         case OPT_KEY:
             key = opt_arg();
             break;
         case OPT_CERT:
             certfile = opt_arg();
+            break;
+        case OPT_CERTFORM:
+            if (!opt_format(opt_arg(), OPT_FMT_ANY, &certformat))
+                goto opthelp;
             break;
         case OPT_SELFSIGN:
             selfsign = 1;
@@ -352,6 +398,12 @@ opthelp:
             if (sigopts == NULL)
                 sigopts = sk_OPENSSL_STRING_new_null();
             if (sigopts == NULL || !sk_OPENSSL_STRING_push(sigopts, opt_arg()))
+                goto end;
+            break;
+        case OPT_VFYOPT:
+            if (vfyopts == NULL)
+                vfyopts = sk_OPENSSL_STRING_new_null();
+            if (vfyopts == NULL || !sk_OPENSSL_STRING_push(vfyopts, opt_arg()))
                 goto end;
             break;
         case OPT_NOTEXT:
@@ -521,8 +573,7 @@ end_of_options:
         }
     }
     pkey = load_key(keyfile, keyformat, 0, key, e, "CA private key");
-    if (key != NULL)
-        OPENSSL_cleanse(key, strlen(key));
+    cleanse(key);
     if (pkey == NULL)
         /* load_key() has already printed an appropriate message */
         goto end;
@@ -534,7 +585,7 @@ end_of_options:
             && (certfile = lookup_conf(conf, section, ENV_CERTIFICATE)) == NULL)
             goto end;
 
-        x509 = load_cert(certfile, FORMAT_PEM, "CA certificate");
+        x509 = load_cert(certfile, certformat, "CA certificate");
         if (x509 == NULL)
             goto end;
 
@@ -605,7 +656,7 @@ end_of_options:
         /*
          * outdir is a directory spec, but access() for VMS demands a
          * filename.  We could use the DEC C routine to convert the
-         * directory syntax to Unixly, and give that to app_isdir,
+         * directory syntax to Unix, and give that to app_isdir,
          * but for now the fopen will catch the error if it's not a
          * directory
          */
@@ -722,34 +773,34 @@ end_of_options:
 
     /*****************************************************************/
     if (req || gencrl) {
-        if (spkac_file != NULL) {
+        if (spkac_file != NULL && outfile != NULL) {
             output_der = 1;
             batch = 1;
         }
-        Sout = bio_open_default(outfile, 'w',
-                                output_der ? FORMAT_ASN1 : FORMAT_TEXT);
-        if (Sout == NULL)
-            goto end;
     }
 
-    if (md == NULL && (md = lookup_conf(conf, section, ENV_DEFAULT_MD)) == NULL)
-        goto end;
-
-    if (strcmp(md, "null") == 0) {
+    def_ret = EVP_PKEY_get_default_digest_nid(pkey, &def_nid);
+    /*
+     * EVP_PKEY_get_default_digest_nid() returns 2 if the digest is
+     * mandatory for this algorithm.
+     */
+    if (def_ret == 2 && def_nid == NID_undef) {
+        /* The signing algorithm requires there to be no digest */
         dgst = EVP_md_null();
+    } else if (md == NULL
+               && (md = lookup_conf(conf, section, ENV_DEFAULT_MD)) == NULL) {
+        goto end;
     } else {
         if (strcmp(md, "default") == 0) {
-            int def_nid;
-            if (EVP_PKEY_get_default_digest_nid(pkey, &def_nid) <= 0) {
+            if (def_ret <= 0) {
                 BIO_puts(bio_err, "no default digest\n");
                 goto end;
             }
             md = (char *)OBJ_nid2sn(def_nid);
         }
 
-        if (!opt_md(md, &dgst)) {
+        if (!opt_md(md, &dgst))
             goto end;
-        }
     }
 
     if (req) {
@@ -889,8 +940,8 @@ end_of_options:
         }
         if (ss_cert_file != NULL) {
             total++;
-            j = certify_cert(&x, ss_cert_file, pkey, x509, dgst, sigopts,
-                             attribs,
+            j = certify_cert(&x, ss_cert_file, certformat, pkey, x509, dgst,
+                             sigopts, vfyopts, attribs,
                              db, serial, subj, chtype, multirdn, email_dn,
                              startdate, enddate, days, batch, extensions,
                              conf, verbose, certopt, get_nameopt(), default_op,
@@ -910,7 +961,8 @@ end_of_options:
         }
         if (infile != NULL) {
             total++;
-            j = certify(&x, infile, pkey, x509p, dgst, sigopts, attribs, db,
+            j = certify(&x, infile, informat, pkey, x509p, dgst,
+                        sigopts, vfyopts, attribs, db,
                         serial, subj, chtype, multirdn, email_dn, startdate,
                         enddate, days, batch, extensions, conf, verbose,
                         certopt, get_nameopt(), default_op, ext_copy, selfsign);
@@ -929,7 +981,9 @@ end_of_options:
         }
         for (i = 0; i < argc; i++) {
             total++;
-            j = certify(&x, argv[i], pkey, x509p, dgst, sigopts, attribs, db,
+            j = certify(&x, argv[i], informat, pkey, x509p, dgst,
+                        sigopts, vfyopts,
+                        attribs, db,
                         serial, subj, chtype, multirdn, email_dn, startdate,
                         enddate, days, batch, extensions, conf, verbose,
                         certopt, get_nameopt(), default_op, ext_copy, selfsign);
@@ -976,7 +1030,7 @@ end_of_options:
             BIO_printf(bio_err, "Write out database with %d new entries\n",
                        sk_X509_num(cert_sk));
 
-            if (!rand_ser
+            if (serialfile != NULL
                     && !save_serial(serialfile, "new", serial, NULL))
                 goto end;
 
@@ -995,7 +1049,7 @@ end_of_options:
         for (i = 0; i < sk_X509_num(cert_sk); i++) {
             BIO *Cout = NULL;
             X509 *xi = sk_X509_value(cert_sk, i);
-            ASN1_INTEGER *serialNumber = X509_get_serialNumber(xi);
+            const ASN1_INTEGER *serialNumber = X509_get0_serialNumber(xi);
             const unsigned char *psn = ASN1_STRING_get0_data(serialNumber);
             const int snl = ASN1_STRING_length(serialNumber);
             const int filen_len = 2 * (snl > 0 ? snl : 1) + sizeof(".pem");
@@ -1025,6 +1079,11 @@ end_of_options:
             if (verbose)
                 BIO_printf(bio_err, "writing %s\n", new_cert);
 
+            Sout = bio_open_default(outfile, 'w',
+                                    output_der ? FORMAT_ASN1 : FORMAT_TEXT);
+            if (Sout == NULL)
+                goto end;
+
             Cout = BIO_new_file(new_cert, "w");
             if (Cout == NULL) {
                 perror(new_cert);
@@ -1033,11 +1092,14 @@ end_of_options:
             write_new_certificate(Cout, xi, 0, notext);
             write_new_certificate(Sout, xi, output_der, notext);
             BIO_free_all(Cout);
+            BIO_free_all(Sout);
+            Sout = NULL;
         }
 
         if (sk_X509_num(cert_sk)) {
             /* Rename the database and the serial file */
-            if (!rotate_serial(serialfile, "new", "old"))
+            if (serialfile != NULL
+                    && !rotate_serial(serialfile, "new", "old"))
                 goto end;
 
             if (!rotate_index(dbfile, "new", "old"))
@@ -1170,10 +1232,9 @@ end_of_options:
         }
 
         /* we have a CRL number that need updating */
-        if (crlnumberfile != NULL)
-            if (!rand_ser
-                    && !save_serial(crlnumberfile, "new", crlnumber, NULL))
-                goto end;
+        if (crlnumberfile != NULL
+                && !save_serial(crlnumberfile, "new", crlnumber, NULL))
+            goto end;
 
         BN_free(crlnumber);
         crlnumber = NULL;
@@ -1181,11 +1242,17 @@ end_of_options:
         if (!do_X509_CRL_sign(crl, pkey, dgst, sigopts))
             goto end;
 
+        Sout = bio_open_default(outfile, 'w',
+                                output_der ? FORMAT_ASN1 : FORMAT_TEXT);
+        if (Sout == NULL)
+            goto end;
+
         PEM_write_bio_X509_CRL(Sout, crl);
 
-        if (crlnumberfile != NULL) /* Rename the crlnumber file */
-            if (!rotate_serial(crlnumberfile, "new", "old"))
-                goto end;
+        /* Rename the crlnumber file */
+        if (crlnumberfile != NULL
+                && !rotate_serial(crlnumberfile, "new", "old"))
+            goto end;
 
     }
     /*****************************************************************/
@@ -1195,7 +1262,7 @@ end_of_options:
             goto end;
         } else {
             X509 *revcert;
-            revcert = load_cert(infile, FORMAT_PEM, infile);
+            revcert = load_cert(infile, certformat, infile);
             if (revcert == NULL)
                 goto end;
             if (dorevoke == 2)
@@ -1230,6 +1297,7 @@ end_of_options:
     BN_free(crlnumber);
     free_index(db);
     sk_OPENSSL_STRING_free(sigopts);
+    sk_OPENSSL_STRING_free(vfyopts);
     EVP_PKEY_free(pkey);
     X509_free(x509);
     X509_CRL_free(crl);
@@ -1247,8 +1315,11 @@ static char *lookup_conf(const CONF *conf, const char *section, const char *tag)
     return entry;
 }
 
-static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
-                   const EVP_MD *dgst, STACK_OF(OPENSSL_STRING) *sigopts,
+static int certify(X509 **xret, const char *infile, int informat,
+                   EVP_PKEY *pkey, X509 *x509,
+                   const EVP_MD *dgst,
+                   STACK_OF(OPENSSL_STRING) *sigopts,
+                   STACK_OF(OPENSSL_STRING) *vfyopts,
                    STACK_OF(CONF_VALUE) *policy, CA_DB *db,
                    BIGNUM *serial, const char *subj, unsigned long chtype,
                    int multirdn, int email_dn, const char *startdate,
@@ -1258,20 +1329,12 @@ static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
                    int default_op, int ext_copy, int selfsign)
 {
     X509_REQ *req = NULL;
-    BIO *in = NULL;
     EVP_PKEY *pktmp = NULL;
     int ok = -1, i;
 
-    in = BIO_new_file(infile, "r");
-    if (in == NULL) {
-        ERR_print_errors(bio_err);
+    req = load_csr(infile, informat, "certificate request");
+    if (req == NULL)
         goto end;
-    }
-    if ((req = PEM_read_bio_X509_REQ(in, NULL, NULL, NULL)) == NULL) {
-        BIO_printf(bio_err, "Error reading certificate request in %s\n",
-                   infile);
-        goto end;
-    }
     if (verbose)
         X509_REQ_print_ex(bio_err, req, nameopt, X509_FLAG_COMPAT);
 
@@ -1287,7 +1350,7 @@ static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
         BIO_printf(bio_err, "error unpacking public key\n");
         goto end;
     }
-    i = X509_REQ_verify(req, pktmp);
+    i = do_X509_REQ_verify(req, pktmp, vfyopts);
     pktmp = NULL;
     if (i < 0) {
         ok = 0;
@@ -1312,12 +1375,14 @@ static int certify(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
 
  end:
     X509_REQ_free(req);
-    BIO_free(in);
     return ok;
 }
 
-static int certify_cert(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x509,
-                        const EVP_MD *dgst, STACK_OF(OPENSSL_STRING) *sigopts,
+static int certify_cert(X509 **xret, const char *infile, int certformat,
+                        EVP_PKEY *pkey, X509 *x509,
+                        const EVP_MD *dgst,
+                        STACK_OF(OPENSSL_STRING) *sigopts,
+                        STACK_OF(OPENSSL_STRING) *vfyopts,
                         STACK_OF(CONF_VALUE) *policy, CA_DB *db,
                         BIGNUM *serial, const char *subj, unsigned long chtype,
                         int multirdn, int email_dn, const char *startdate,
@@ -1330,7 +1395,7 @@ static int certify_cert(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x
     EVP_PKEY *pktmp = NULL;
     int ok = -1, i;
 
-    if ((req = load_cert(infile, FORMAT_PEM, infile)) == NULL)
+    if ((req = load_cert(infile, certformat, infile)) == NULL)
         goto end;
     if (verbose)
         X509_print(bio_err, req);
@@ -1341,7 +1406,7 @@ static int certify_cert(X509 **xret, const char *infile, EVP_PKEY *pkey, X509 *x
         BIO_printf(bio_err, "error unpacking public key\n");
         goto end;
     }
-    i = X509_verify(req, pktmp);
+    i = do_X509_verify(req, pktmp, vfyopts);
     if (i < 0) {
         ok = 0;
         BIO_printf(bio_err, "Signature verification problems....\n");
@@ -1378,7 +1443,8 @@ static int do_body(X509 **xret, EVP_PKEY *pkey, X509 *x509,
                    CONF *lconf, unsigned long certopt, unsigned long nameopt,
                    int default_op, int ext_copy, int selfsign)
 {
-    X509_NAME *name = NULL, *CAname = NULL, *subject = NULL;
+    const X509_NAME *name = NULL;
+    X509_NAME *CAname = NULL, *subject = NULL;
     const ASN1_TIME *tm;
     ASN1_STRING *str, *str2;
     ASN1_OBJECT *obj;
@@ -1397,7 +1463,7 @@ static int do_body(X509 **xret, EVP_PKEY *pkey, X509 *x509,
         row[i] = NULL;
 
     if (subj) {
-        X509_NAME *n = parse_name(subj, chtype, multirdn);
+        X509_NAME *n = parse_name(subj, chtype, multirdn, "subject");
 
         if (!n) {
             ERR_print_errors(bio_err);
@@ -1577,7 +1643,7 @@ static int do_body(X509 **xret, EVP_PKEY *pkey, X509 *x509,
         BIO_printf(bio_err,
                    "Everything appears to be ok, creating and signing the certificate\n");
 
-    if ((ret = X509_new()) == NULL)
+    if ((ret = X509_new_with_libctx(app_get0_libctx(), app_get0_propq())) == NULL)
         goto end;
 
 #ifdef X509_V3
@@ -1698,11 +1764,11 @@ static int do_body(X509 **xret, EVP_PKEY *pkey, X509 *x509,
             BIO_printf(bio_err, "Memory allocation failure\n");
             goto end;
         }
+        i = -1;
         while ((i = X509_NAME_get_index_by_NID(dn_subject,
                                                NID_pkcs9_emailAddress,
-                                               -1)) >= 0) {
-            tmpne = X509_NAME_get_entry(dn_subject, i);
-            X509_NAME_delete_entry(dn_subject, i);
+                                               i)) >= 0) {
+            tmpne = X509_NAME_delete_entry(dn_subject, i--);
             X509_NAME_ENTRY_free(tmpne);
         }
 
@@ -2047,7 +2113,7 @@ static int do_revoke(X509 *x509, CA_DB *db, REVINFO_TYPE rev_type,
     for (i = 0; i < DB_NUMBER; i++)
         row[i] = NULL;
     row[DB_name] = X509_NAME_oneline(X509_get_subject_name(x509), NULL, 0);
-    bn = ASN1_INTEGER_to_BN(X509_get_serialNumber(x509), NULL);
+    bn = ASN1_INTEGER_to_BN(X509_get0_serialNumber(x509), NULL);
     if (!bn)
         goto end;
     if (BN_is_zero(bn))
